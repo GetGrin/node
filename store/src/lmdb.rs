@@ -111,20 +111,11 @@ impl Store {
 		db_name: Option<&str>,
 		max_readers: Option<u32>,
 	) -> Result<Store, Error> {
-		let name = env_name
-			.map(|n| {
-				if n != DEFAULT_ENV_NAME {
-					DEFAULT_ENV_NAME
-				} else {
-					n
-				}
-			})
-			.unwrap_or_else(|| DEFAULT_ENV_NAME);
 		let db_name = db_name.unwrap_or_else(|| DEFAULT_ENV_NAME);
 
 		// Database path setup.
 		let full_path = Path::new(root_path)
-			.join(name)
+			.join(DEFAULT_ENV_NAME)
 			.to_str()
 			.unwrap()
 			.to_string();
@@ -189,7 +180,7 @@ impl Store {
 				if s.migrate_to_default_env(&migrate_from).is_ok() {
 					let _ = fs::remove_dir_all(&migrate_from);
 				} else {
-					error!("Migrating {} failed", name);
+					error!("Migrating DB {} failed", env_name);
 				}
 			}
 		}
@@ -202,7 +193,7 @@ impl Store {
 		if !from_path.exists() {
 			return Ok(());
 		};
-		debug!("Migrating {} to {:?}", self.name, self.env_path);
+		debug!("Migrating DB {} to {}", self.name, DEFAULT_ENV_NAME);
 		let from_env = unsafe {
 			let mut options = EnvOpenOptions::new().read_txn_without_tls();
 			let env_options = options.map_size(self.alloc_chunk_size).max_dbs(1);
@@ -225,7 +216,7 @@ impl Store {
 			}
 		}
 		write_to.commit()?;
-		debug!("Migrated {} records from {}", count, self.name);
+		debug!("Migrated {} records from DB {}", count, self.name);
 		Ok(())
 	}
 
@@ -288,6 +279,10 @@ impl Store {
 			env_info.map_size
 		};
 
+		if resize {
+			debug!("Resizing DB to {} from {}", new_size, env_info.map_size);
+		}
+
 		(resize, new_size)
 	}
 
@@ -315,6 +310,7 @@ impl Store {
 			Some(d) => d,
 			_ => DeserializationMode::default(),
 		};
+		self.wait_for_resize();
 		let read = self.env.read_txn()?;
 		self.get_with(key, &read, |_, mut data| {
 			ser::deserialize(&mut data, self.protocol_version(), d).map_err(From::from)
@@ -323,6 +319,7 @@ impl Store {
 
 	/// Whether the provided key exists.
 	pub fn exists(&self, key: &[u8]) -> Result<bool, Error> {
+		self.wait_for_resize();
 		let read = self.env.read_txn()?;
 		let res = self.db.get(&read, key)?;
 		Ok(res.is_some())
@@ -337,6 +334,7 @@ impl Store {
 	where
 		F: Fn(&[u8], &[u8]) -> Result<T, Error>,
 	{
+		self.wait_for_resize();
 		let read = self.env.read_txn()?;
 		Ok(PrefixIterator::new(
 			self.db.clone(),
@@ -346,8 +344,8 @@ impl Store {
 		))
 	}
 
-	/// Resize database environment if needed.
-	fn maybe_resize(&self) -> Result<(), Error> {
+	/// Wait while DB is resizing.
+	fn wait_for_resize(&self) {
 		loop {
 			let resizing = {
 				let res_map = ENV_RESIZING.get_or_init(|| Arc::new(RwLock::new(HashMap::new())));
@@ -357,9 +355,14 @@ impl Store {
 			if !resizing {
 				break;
 			}
-			trace!("Wait resizing DB");
+			debug!("Wait on {}, resizing DB", self.name);
 			thread::sleep(Duration::from_millis(500));
 		}
+	}
+
+	/// Resize database environment if needed.
+	fn maybe_resize(&self) -> Result<(), Error> {
+		self.wait_for_resize();
 		let (resize, new_size) = Self::needs_resize(&self.env, self.alloc_chunk_size);
 		if resize {
 			let res_map = ENV_RESIZING.get().unwrap();
@@ -367,16 +370,16 @@ impl Store {
 				let mut w_res_map = res_map.write();
 				w_res_map.insert(self.env_path.clone(), true);
 			}
-			trace!("Start resizing {} DB", self.name);
+			debug!("Start resizing {} DB", self.name);
 			unsafe {
-				thread::sleep(Duration::from_millis(3000));
+				thread::sleep(Duration::from_millis(2000));
 				self.env.resize(new_size)?;
 			}
 			{
 				let mut w_res_map = res_map.write();
 				w_res_map.insert(self.env_path.clone(), false);
 			}
-			trace!("End resizing {} DB", self.name);
+			debug!("End resizing {} DB", self.name);
 		}
 		Ok(())
 	}
