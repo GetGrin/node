@@ -240,7 +240,8 @@ fn monitor_peers(peers: Arc<p2p::Peers>, config: p2p::P2PConfig, tx: mpsc::Sende
 		.iter()
 		.filter(|p| {
 			peers.get_connected_peer(p.addr).is_none()
-				&& (enough_outbound && Utc::now().timestamp() - p.last_attempt >= max_attempt_delay)
+				&& (!enough_outbound
+					|| Utc::now().timestamp() - p.last_attempt >= max_attempt_delay)
 		})
 		.choose_multiple(&mut thread_rng(), max_peer_attempts / 2)
 	{
@@ -269,7 +270,9 @@ fn monitor_peers(peers: Arc<p2p::Peers>, config: p2p::P2PConfig, tx: mpsc::Sende
 	// check min 32 (max 128, if there are no healthy and unknown) random defunct peers no more often than 1 hour per peer.
 	for dp in defuncts
 		.iter()
-		.filter(|p| enough_outbound && Utc::now().timestamp() - p.last_attempt >= max_attempt_delay)
+		.filter(|p| {
+			!enough_outbound || Utc::now().timestamp() - p.last_attempt >= max_attempt_delay
+		})
 		.choose_multiple(&mut thread_rng(), max_peer_attempts - new_peers.len())
 	{
 		new_peers.push(&dp.addr);

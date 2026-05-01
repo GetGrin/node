@@ -520,9 +520,6 @@ impl Desegmenter {
 		let mut elems_added = 0;
 		if let Some(mut next_output_idx) = self.next_required_output_segment_index() {
 			while (next_output_idx as usize) < total_output_segments {
-				if self.output_segment_cache.len() >= self.max_cached_segments {
-					break;
-				}
 				if elems_added == max_elements / 3 {
 					break;
 				}
@@ -547,9 +544,6 @@ impl Desegmenter {
 		elems_added = 0;
 		if let Some(mut next_rp_idx) = self.next_required_rangeproof_segment_index() {
 			while (next_rp_idx as usize) < total_rangeproof_segments {
-				if self.rangeproof_segment_cache.len() >= self.max_cached_segments {
-					break;
-				}
 				if elems_added == max_elements / 3 {
 					break;
 				}
@@ -573,9 +567,6 @@ impl Desegmenter {
 		elems_added = 0;
 		if let Some(mut next_kernel_idx) = self.next_required_kernel_segment_index() {
 			while (next_kernel_idx as usize) < total_kernel_segments {
-				if self.kernel_segment_cache.len() >= self.max_cached_segments {
-					break;
-				}
 				if elems_added == max_elements / 3 {
 					break;
 				}
@@ -592,6 +583,16 @@ impl Desegmenter {
 			}
 		}
 
+		// Explicitly add segment identifier to request if not exists.
+		let mut maybe_add_to_request = |seg_id: SegmentTypeIdentifier| {
+			if return_vec.iter().any(|i| i == &seg_id) {
+				if return_vec.len() >= max_elements {
+					return_vec.pop();
+				}
+				return_vec.push(seg_id);
+			}
+		};
+
 		// Ensure we explicitly ask for the next output segment.
 		if let Some(next_output_idx) = self.next_required_output_segment_index() {
 			let seg_id = SegmentIdentifier {
@@ -599,10 +600,8 @@ impl Desegmenter {
 				idx: next_output_idx,
 			};
 			if !self.has_output_segment_with_id(seg_id) {
-				if return_vec.len() >= max_elements {
-					return_vec.pop();
-				}
-				return_vec.push(SegmentTypeIdentifier::new(SegmentType::Output, seg_id));
+				let next_output_seg_id = SegmentTypeIdentifier::new(SegmentType::Output, seg_id);
+				maybe_add_to_request(next_output_seg_id);
 			}
 		}
 
@@ -613,10 +612,8 @@ impl Desegmenter {
 				idx: next_rp_idx,
 			};
 			if !self.has_rangeproof_segment_with_id(seg_id) {
-				if return_vec.len() >= max_elements {
-					return_vec.pop();
-				}
-				return_vec.push(SegmentTypeIdentifier::new(SegmentType::RangeProof, seg_id));
+				let next_proof_seg_id = SegmentTypeIdentifier::new(SegmentType::RangeProof, seg_id);
+				maybe_add_to_request(next_proof_seg_id);
 			}
 		}
 
@@ -628,14 +625,9 @@ impl Desegmenter {
 				height: self.default_kernel_segment_height,
 				idx: next_kernel_idx,
 			};
-			let next_kernel_seg_id = SegmentTypeIdentifier::new(SegmentType::Kernel, seg_id);
-			if !self.has_kernel_segment_with_id(seg_id)
-				&& !return_vec.iter().any(|x| x == &next_kernel_seg_id)
-			{
-				if return_vec.len() >= max_elements {
-					return_vec.pop();
-				}
-				return_vec.push(next_kernel_seg_id);
+			if !self.has_kernel_segment_with_id(seg_id) {
+				let next_kernel_seg_id = SegmentTypeIdentifier::new(SegmentType::Kernel, seg_id);
+				maybe_add_to_request(next_kernel_seg_id);
 			}
 		}
 		if return_vec.is_empty() && self.bitmap_cache.is_some() {
