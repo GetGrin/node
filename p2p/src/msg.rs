@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::{fmt, thread, time::Duration};
 
 /// Grin's user agent with current version
-pub const USER_AGENT: &str = concat!("MW/Grin ", env!("CARGO_PKG_VERSION"));
+pub const USER_AGENT: &str = concat!("MW/Grim ", env!("CARGO_PKG_VERSION"), "+");
 
 /// Magic numbers expected in the header of every message
 const OTHER_MAGIC: [u8; 2] = [73, 43];
