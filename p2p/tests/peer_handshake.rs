@@ -88,7 +88,10 @@ fn peer_handshake() {
 	)
 	.unwrap();
 
-	assert!(peer.info.user_agent.ends_with(env!("CARGO_PKG_VERSION")));
+	assert!(peer
+		.info
+		.user_agent
+		.ends_with(format!("{}+", env!("CARGO_PKG_VERSION")).as_str()));
 
 	thread::sleep(time::Duration::from_secs(1));
 
