@@ -45,10 +45,6 @@ pub mod built_info {
 	include!(concat!(env!("OUT_DIR"), "/built.rs"));
 }
 
-fn version() -> &'static str {
-	built_info::GIT_COMMIT_HASH_SHORT.unwrap_or("+")
-}
-
 /// Grin's user agent with current version
 pub fn user_agent() -> String {
 	format!(

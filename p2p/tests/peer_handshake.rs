@@ -18,15 +18,15 @@ use grin_p2p as p2p;
 use grin_util as util;
 use grin_util::StopState;
 
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::Arc;
-use std::{thread, time};
-
 use crate::core::core::hash::Hash;
 use crate::core::global;
 use crate::core::pow::Difficulty;
 use crate::p2p::types::PeerAddr;
 use crate::p2p::Peer;
+use grin_p2p::msg::built_info;
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::Arc;
+use std::{thread, time};
 
 fn open_port() -> u16 {
 	// use port 0 to allow the OS to assign an open port
@@ -88,10 +88,12 @@ fn peer_handshake() {
 	)
 	.unwrap();
 
+	let git_hash =
+		built_info::GIT_COMMIT_HASH_SHORT.map_or_else(|| "+".to_owned(), |v| ".".to_owned() + v);
 	assert!(peer
 		.info
 		.user_agent
-		.ends_with(format!("{}+", env!("CARGO_PKG_VERSION")).as_str()));
+		.ends_with(format!("{}{}", env!("CARGO_PKG_VERSION"), git_hash).as_str()));
 
 	thread::sleep(time::Duration::from_secs(1));
 
