@@ -2,7 +2,7 @@ name: Build and Push to GHCR
 
 on:
   push:
-    branches: [master, staging]
+    branches: [grim]
 
 env:
   GHCR_IMAGE: ghcr.io/${{ secrets.GHCR_USERNAME }}/${{ github.event.repository.name }}
