@@ -18,6 +18,7 @@ use heed::types::Bytes;
 use heed::{Database, Env, EnvOpenOptions, RoTxn, RwTxn, WithoutTls};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use std::{fs, thread};
@@ -83,7 +84,7 @@ where
 const DEFAULT_DB_VERSION: ProtocolVersion = ProtocolVersion(3);
 
 /// Default environment.
-const DEFAULT_ENV_NAME: &'static str = "lmdb";
+pub const DEFAULT_ENV_NAME: &'static str = "lmdb";
 /// Default multi-database environment without prefixes.
 const DEFAULT_MULTI_DB_ENV_NAME: &'static str = "multi_lmdb";
 /// Prefix key separator.
@@ -95,10 +96,10 @@ static ENV_MAP: OnceLock<RwLock<HashMap<String, EnvState>>> = OnceLock::new();
 /// State of active database environment.
 struct EnvState {
 	env: Env<WithoutTls>,
-	open_txs_count: u32,
-	resizing: bool,
-	resize_checking: bool,
-	stores_count: u32,
+	open_txs_count: AtomicU32,
+	resizing: AtomicBool,
+	resize_checking: AtomicBool,
+	stores_count: AtomicU32,
 }
 
 /// LMDB-backed store facilitating data access and serialization. All writes
@@ -116,7 +117,16 @@ impl Drop for Store {
 	fn drop(&mut self) {
 		{
 			let mut w_map = ENV_MAP.get().unwrap().write();
-			w_map.get_mut(&self.env_path).unwrap().stores_count -= 1;
+			let stores_count = w_map
+				.get(&self.env_path)
+				.unwrap()
+				.stores_count
+				.load(Ordering::Relaxed);
+			w_map
+				.get_mut(&self.env_path)
+				.unwrap()
+				.stores_count
+				.store(stores_count - 1, Ordering::Relaxed);
 		}
 		let no_stores = {
 			ENV_MAP
@@ -126,6 +136,7 @@ impl Drop for Store {
 				.get(&self.env_path)
 				.unwrap()
 				.stores_count
+				.load(Ordering::Relaxed)
 				== 0
 		};
 		if no_stores {
@@ -193,15 +204,24 @@ impl Store {
 				full_path.clone(),
 				EnvState {
 					env,
-					open_txs_count: 0,
-					resizing: false,
-					resize_checking: false,
-					stores_count: 1,
+					open_txs_count: AtomicU32::new(0),
+					resizing: AtomicBool::new(false),
+					resize_checking: AtomicBool::new(false),
+					stores_count: AtomicU32::new(1),
 				},
 			);
 		} else {
 			let mut w_env_map = env_map.write();
-			w_env_map.get_mut(&full_path).unwrap().stores_count += 1;
+			let stores_count = w_env_map
+				.get(&full_path)
+				.unwrap()
+				.stores_count
+				.load(Ordering::Relaxed);
+			w_env_map
+				.get_mut(&full_path)
+				.unwrap()
+				.stores_count
+				.store(stores_count + 1, Ordering::Relaxed);
 		}
 
 		// Database setup.
@@ -235,7 +255,16 @@ impl Store {
 					Ok(_) => {
 						let _ = fs::remove_dir_all(&migrate_from);
 					}
-					Err(e) => error!("DB {} migration error: {:?}", env_name, e),
+					Err(e) => {
+						error!("DB {} migration error: {:?}", env_name, e);
+						match s.clear() {
+							Ok(_) => {}
+							Err(e) => {
+								error!("Can not clear new DB after unsuccessful migration: {:?}", e)
+							}
+						}
+						return Err(e);
+					}
 				}
 			}
 		}
@@ -249,7 +278,7 @@ impl Store {
 		from_name: Option<&str>,
 		from_path: &Path,
 	) -> Result<(), Error> {
-		debug!("Migrating DB {:?}", from_path);
+		info!("Migrating DB {:?}, please wait...", from_path);
 		let from_env = unsafe {
 			let mut options = EnvOpenOptions::new().read_txn_without_tls();
 			let env_options = options.map_size(self.alloc_chunk_size).max_dbs(24);
@@ -257,10 +286,11 @@ impl Store {
 		};
 		let (resize, new_size) = needs_resize(&from_env, self.alloc_chunk_size);
 		if resize {
+			// We are sure there are no active txs, cause migration is called on database creation.
 			unsafe {
 				from_env.resize(new_size)?;
 				self.env.resize(new_size)?;
-			};
+			}
 		}
 		let db_from = {
 			let mut write = from_env.write_txn()?;
@@ -272,21 +302,23 @@ impl Store {
 		let read_from = from_env.read_txn()?;
 		let mut count = 0;
 		for kv in db_from.iter(&read_from)? {
-			if let Ok((k, v)) = kv {
-				if k.contains(&PREFIX_KEY_SEPARATOR) {
-					let db_name = k.split_at(1).0;
-					let db = self.pre_dbs.get(&db_name[0]).unwrap();
+			let (k, v) = kv?;
+			if k.len() > 1 && k[1] == PREFIX_KEY_SEPARATOR {
+				let db_name = k.split_at(1).0;
+				if let Some(db) = self.pre_dbs.get(&db_name[0]) {
 					let key = k.split_at(2).1;
 					db.put(&mut write_to, key, &v)?;
 					count += 1;
 				} else {
-					self.def_db.put(&mut write_to, k, &v)?;
-					count += 1;
+					error!("Migration: unknown DB key: {}", db_name[0]);
 				}
+			} else {
+				self.def_db.put(&mut write_to, k, &v)?;
+				count += 1;
 			}
 		}
 		write_to.commit()?;
-		debug!("Migrated {} records from DB {:?}", count, from_path);
+		info!("Migrated {} records from {:?}", count, from_path);
 		Ok(())
 	}
 
@@ -299,6 +331,7 @@ impl Store {
 			.get(&self.env_path)
 			.unwrap()
 			.open_txs_count
+			.load(Ordering::Relaxed)
 	}
 
 	/// Check if requirement for environment resize is checking.
@@ -310,6 +343,7 @@ impl Store {
 			.get(&self.env_path)
 			.unwrap()
 			.resize_checking
+			.load(Ordering::Relaxed)
 	}
 
 	/// Set flag if requirement for environment resize is checking.
@@ -320,7 +354,8 @@ impl Store {
 			.write()
 			.get_mut(&self.env_path)
 			.unwrap()
-			.resize_checking = resize_checking;
+			.resize_checking
+			.store(resize_checking, Ordering::Relaxed);
 	}
 
 	/// Wait while database is resizing.
@@ -333,6 +368,7 @@ impl Store {
 				.get(&self.env_path)
 				.unwrap()
 				.resizing
+				.load(Ordering::Relaxed)
 			{
 				break;
 			}
@@ -368,7 +404,8 @@ impl Store {
 							.read()
 							.get(&env_path)
 							.unwrap()
-							.open_txs_count;
+							.open_txs_count
+							.load(Ordering::Relaxed);
 						if txs_count == 0 {
 							debug!("Start resizing DB {}", env_path);
 							ENV_MAP
@@ -377,11 +414,13 @@ impl Store {
 								.write()
 								.get_mut(&env_path)
 								.unwrap()
-								.resizing = true;
+								.resizing
+								.store(true, Ordering::Relaxed);
 							// Wait to make sure there are no more active txs left.
 							thread::sleep(Duration::from_millis(1000));
 							break;
 						}
+						thread::sleep(Duration::from_millis(10));
 					}
 
 					unsafe {
@@ -393,8 +432,8 @@ impl Store {
 
 					let mut w_env_map = ENV_MAP.get().unwrap().write();
 					let env_state = w_env_map.get_mut(&env_path).unwrap();
-					env_state.resizing = false;
-					env_state.resize_checking = false;
+					env_state.resizing.store(false, Ordering::Relaxed);
+					env_state.resize_checking.store(false, Ordering::Relaxed);
 				});
 				return;
 			} else {
@@ -402,18 +441,29 @@ impl Store {
 				let env_state = w_env_map.get_mut(&env_path).unwrap();
 
 				debug!("Start immediate resizing DB {}", env_path);
-				env_state.resizing = true;
+				env_state.resizing.store(true, Ordering::Relaxed);
 				unsafe {
 					match env.resize(new_size) {
 						Ok(_) => debug!("End resizing DB {}", env_path),
 						Err(e) => error!("Resize DB {} error: {:?}", env_path, e),
 					}
 				}
-				env_state.resizing = false;
+				env_state.resizing.store(false, Ordering::Relaxed);
 			}
 		}
 
 		self.set_resize_checking(false);
+	}
+
+	/// Clear all data from database environment.
+	fn clear(&self) -> Result<(), Error> {
+		let mut w = self.env.write_txn()?;
+		self.def_db.clear(&mut w)?;
+		for db in self.pre_dbs.values() {
+			db.clear(&mut w)?;
+		}
+		w.commit()?;
+		Ok(())
 	}
 
 	/// Protocol version for the store.
@@ -422,10 +472,16 @@ impl Store {
 	}
 
 	/// Get database from provided key or return default.
-	fn get_db(&self, db_key: Option<u8>) -> &Database<Bytes, Bytes> {
+	fn get_db(&self, db_key: Option<u8>) -> Result<&Database<Bytes, Bytes>, Error> {
 		match db_key {
-			Some(db) => self.pre_dbs.get(&db).unwrap(),
-			None => &self.def_db,
+			Some(db) => {
+				if let Some(db) = self.pre_dbs.get(&db) {
+					Ok(db)
+				} else {
+					Err(Error::OtherErr("db for provided key not found".to_string()))
+				}
+			}
+			None => Ok(&self.def_db),
 		}
 	}
 
@@ -441,7 +497,7 @@ impl Store {
 	where
 		F: Fn(&[u8], &[u8]) -> Result<T, Error>,
 	{
-		let db = self.get_db(db_key);
+		let db = self.get_db(db_key)?;
 		let res: Option<&[u8]> = db.get(read, key)?;
 		match res {
 			None => Ok(None),
@@ -484,10 +540,15 @@ impl Store {
 		let res = {
 			match self.env.read_txn() {
 				Ok(read) => {
-					let db = self.get_db(db_key);
-					let res = db.get(&read, key);
-					match res {
-						Ok(r) => Ok(r.is_some()),
+					let db_res = self.get_db(db_key);
+					match db_res {
+						Ok(db) => {
+							let res = db.get(&read, key);
+							match res {
+								Ok(r) => Ok(r.is_some()),
+								Err(e) => Err(Error::from(e)),
+							}
+						}
 						Err(e) => Err(Error::from(e)),
 					}
 				}
@@ -512,13 +573,19 @@ impl Store {
 		TxCounter::on_change_tx_count(&self.env_path, true);
 		match self.env.clone().static_read_txn() {
 			Ok(read) => {
-				let db = self.get_db(db_key);
-				Ok(DatabaseIterator::new(
-					self,
-					Arc::new(db.clone()),
-					read,
-					deserialize,
-				))
+				let db_res = self.get_db(db_key);
+				match db_res {
+					Ok(db) => Ok(DatabaseIterator::new(
+						self,
+						Arc::new(db.clone()),
+						read,
+						deserialize,
+					)),
+					Err(e) => {
+						TxCounter::on_change_tx_count(&self.env_path, false);
+						Err(Error::from(e))
+					}
+				}
 			}
 			Err(e) => {
 				TxCounter::on_change_tx_count(&self.env_path, false);
@@ -558,10 +625,15 @@ impl TxCounter {
 	fn on_change_tx_count(env_path: &String, inc: bool) {
 		let mut w_env_map = ENV_MAP.get().unwrap().write();
 		let env_state = w_env_map.get_mut(env_path).unwrap();
+		let open_txs_count = env_state.open_txs_count.load(Ordering::Relaxed);
 		if inc {
-			env_state.open_txs_count += 1;
+			env_state
+				.open_txs_count
+				.store(open_txs_count + 1, Ordering::Relaxed);
 		} else {
-			env_state.open_txs_count -= 1;
+			env_state
+				.open_txs_count
+				.store(open_txs_count - 1, Ordering::Relaxed);
 		}
 	}
 }
@@ -589,7 +661,7 @@ impl<'a> Batch<'a> {
 
 	/// Writes a single key/value pair to the provided database key.
 	pub fn put(&mut self, db_key: Option<u8>, key: &[u8], value: &[u8]) -> Result<(), Error> {
-		let db = self.store.get_db(db_key);
+		let db = self.store.get_db(db_key)?;
 		db.put(&mut self.write, key, value)?;
 		Ok(())
 	}
@@ -645,7 +717,7 @@ impl<'a> Batch<'a> {
 	/// This is in the context of the current write transaction.
 	pub fn exists(&self, db_key: Option<u8>, key: &[u8]) -> Result<bool, Error> {
 		let read = self.write.nested_read_txn()?;
-		let db = self.store.get_db(db_key);
+		let db = self.store.get_db(db_key)?;
 		let res = db.get(&read, key)?;
 		Ok(res.is_some())
 	}
@@ -683,7 +755,7 @@ impl<'a> Batch<'a> {
 
 	/// Deletes a key/value pair from the database.
 	pub fn delete(&mut self, db_key: Option<u8>, key: &[u8]) -> Result<(), Error> {
-		let db = self.store.get_db(db_key);
+		let db = self.store.get_db(db_key)?;
 		db.delete(&mut self.write, key)?;
 		Ok(())
 	}
@@ -723,7 +795,9 @@ where
 	db: Arc<Database<Bytes, Bytes>>,
 	read: Arc<RoTxn<'static, WithoutTls>>,
 	keys: Vec<Vec<u8>>,
-	skip: usize,
+	total_keys: usize,
+	skip_cur: usize,
+	skip_total: usize,
 	deserialize: F,
 	#[allow(dead_code)]
 	tx_counter: TxCounter,
@@ -733,20 +807,47 @@ impl<F, T> Iterator for DatabaseIterator<F, T>
 where
 	F: Fn(&[u8], &[u8]) -> Result<T, Error>,
 {
-	type Item = T;
+	type Item = Result<T, Error>;
 
 	fn next(&mut self) -> Option<Self::Item> {
-		if let Some(k) = self.keys.iter().skip(self.skip).next() {
-			let v = self.db.get(&self.read, k).unwrap_or(None);
-			if let Some(v) = v {
-				return match (self.deserialize)(k, v) {
-					Ok(v) => {
-						self.skip += 1;
-						Some(v)
+		if let Some(k) = self.keys.iter().skip(self.skip_cur).next() {
+			match self.db.get(&self.read, k) {
+				Ok(v) => {
+					if let Some(v) = v {
+						return match (self.deserialize)(k, v) {
+							Ok(v) => {
+								self.skip_total += 1;
+								self.skip_cur += 1;
+								Some(Ok(v))
+							}
+							Err(e) => {
+								error!("db iter: error deserializing: {}", e);
+								Some(Err(Error::from(e)))
+							}
+						};
 					}
-					Err(_) => None,
-				};
+				}
+				Err(e) => {
+					return {
+						error!("db iter: error read value: {}", e);
+						Some(Err(Error::from(e)))
+					}
+				}
 			}
+		} else if self.total_keys > self.skip_total {
+			let keys = if let Ok(iter) = self.db.iter(&self.read) {
+				iter.move_between_keys()
+					.skip(self.skip_total)
+					.take(10000)
+					.filter(|kv| kv.is_ok())
+					.map(|kv| kv.unwrap().0.to_vec())
+					.collect::<Vec<Vec<u8>>>()
+			} else {
+				vec![]
+			};
+			self.skip_cur = 0;
+			self.keys = keys;
+			return self.next();
 		}
 		None
 	}
@@ -763,19 +864,28 @@ where
 		read: RoTxn<'static, WithoutTls>,
 		deserialize: F,
 	) -> DatabaseIterator<F, T> {
-		let keys = if let Ok(iter) = db.iter(&read) {
-			iter.move_between_keys()
-				.filter(|kv| kv.is_ok())
-				.map(|kv| kv.unwrap().0.to_vec())
-				.collect::<Vec<Vec<u8>>>()
+		let (keys, total_keys) = if let Ok(iter) = db.iter(&read) {
+			let total = iter.move_between_keys().count();
+			let keys = if let Ok(iter) = db.iter(&read) {
+				iter.move_between_keys()
+					.take(10000)
+					.filter(|kv| kv.is_ok())
+					.map(|kv| kv.unwrap().0.to_vec())
+					.collect::<Vec<Vec<u8>>>()
+			} else {
+				vec![]
+			};
+			(keys, total)
 		} else {
-			vec![]
+			(vec![], 0)
 		};
 		DatabaseIterator {
 			db,
 			read: Arc::new(read),
 			keys,
-			skip: 0,
+			total_keys,
+			skip_cur: 0,
+			skip_total: 0,
 			deserialize,
 			tx_counter: TxCounter {
 				env_path: store.env_path.clone(),
