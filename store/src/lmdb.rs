@@ -19,7 +19,7 @@ use heed::{Database, Env, EnvOpenOptions, RoTxn, RwTxn, WithoutTls};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{mpsc, Arc, OnceLock};
 use std::time::Duration;
 use std::{fs, thread};
 
@@ -87,6 +87,8 @@ const DEFAULT_DB_VERSION: ProtocolVersion = ProtocolVersion(3);
 pub const DEFAULT_ENV_NAME: &'static str = "lmdb";
 /// Default multi-database environment without prefixes.
 const DEFAULT_MULTI_DB_ENV_NAME: &'static str = "multi_lmdb";
+/// Migration completion marker in the default database.
+const MIGRATION_COMPLETE_KEY: &[u8] = b"__grin_migration_complete";
 /// Prefix key separator.
 pub const PREFIX_KEY_SEPARATOR: u8 = b':';
 
@@ -159,6 +161,7 @@ impl Store {
 		db_name: Option<&str>,
 		prefixes: Vec<u8>,
 		max_readers: Option<u32>,
+		db_migration_prog_tx: Option<mpsc::Sender<i8>>,
 	) -> Result<Store, Error> {
 		let full_path = Path::new(root_path)
 			.join(DEFAULT_MULTI_DB_ENV_NAME)
@@ -225,25 +228,28 @@ impl Store {
 		}
 
 		// Database setup.
-		let r_env_map = env_map.read();
-		let env = r_env_map.get(&full_path).unwrap().env.clone();
-		let mut write = env.write_txn()?;
-		let def_name = db_name.unwrap_or(DEFAULT_ENV_NAME);
-		let def_db = env.create_database(&mut write, Some(def_name))?;
-		let mut dbs_map = HashMap::<u8, Database<Bytes, Bytes>>::new();
-		for p in prefixes {
-			let db = env.create_database(&mut write, Some(p.to_string().as_str()))?;
-			dbs_map.insert(p, db);
-		}
-		write.commit()?;
+		let s = {
+			let r_env_map = env_map.read();
+			let env = r_env_map.get(&full_path).unwrap().env.clone();
+			let mut write = env.write_txn()?;
+			let def_name = db_name.unwrap_or(DEFAULT_ENV_NAME);
+			let def_db = env.create_database(&mut write, Some(def_name))?;
+			let mut dbs_map = HashMap::<u8, Database<Bytes, Bytes>>::new();
+			for p in prefixes {
+				let db = env.create_database(&mut write, Some(p.to_string().as_str()))?;
+				dbs_map.insert(p, db);
+			}
+			write.commit()?;
 
-		let s = Store {
-			env: env.clone(),
-			env_path: full_path.clone(),
-			pre_dbs: Arc::new(dbs_map),
-			def_db,
-			version: DEFAULT_DB_VERSION,
-			alloc_chunk_size,
+			let s = Store {
+				env: env.clone(),
+				env_path: full_path.clone(),
+				pre_dbs: Arc::new(dbs_map),
+				def_db,
+				version: DEFAULT_DB_VERSION,
+				alloc_chunk_size,
+			};
+			s
 		};
 
 		// Migrate to default environment if needed.
@@ -251,25 +257,42 @@ impl Store {
 		if env_name != DEFAULT_MULTI_DB_ENV_NAME {
 			let migrate_from = Path::new(root_path).join(env_name);
 			if migrate_from.exists() {
-				match s.migrate_to_default_env(db_name, &migrate_from) {
-					Ok(_) => match fs::remove_dir_all(&migrate_from) {
-						Ok(_) => {}
+				let delete_old_db_file = || -> Result<(), Error> {
+					match fs::remove_dir_all(&migrate_from) {
+						Ok(_) => Ok(()),
 						Err(e) => {
 							return Err(Error::FileErr(format!(
 								"Can not remove old DB file: {:?}",
 								e
 							)));
 						}
-					},
-					Err(e) => {
-						error!("DB {} migration error: {:?}", env_name, e);
-						match s.clear() {
-							Ok(_) => {}
-							Err(e) => {
-								error!("Can not clear new DB after unsuccessful migration: {:?}", e)
+					}
+				};
+				if s.migration_complete()? {
+					if let Err(e) = delete_old_db_file() {
+						return Err(e);
+					}
+				} else {
+					let _ = s.clear();
+					match s.migrate_to_default_env(db_name, &migrate_from, db_migration_prog_tx) {
+						Ok(_) => {
+							if let Err(e) = delete_old_db_file() {
+								return Err(e);
 							}
 						}
-						return Err(e);
+						Err(e) => {
+							error!("DB {} migration error: {:?}", env_name, e);
+							match s.clear() {
+								Ok(_) => {}
+								Err(e) => {
+									error!(
+										"Can not clear new DB after unsuccessful migration: {:?}",
+										e
+									)
+								}
+							}
+							return Err(e);
+						}
 					}
 				}
 			}
@@ -278,13 +301,31 @@ impl Store {
 		Ok(s)
 	}
 
+	/// Check if migration has already completed successfully.
+	fn migration_complete(&self) -> Result<bool, Error> {
+		let read = self.env.read_txn()?;
+		Ok(self.def_db.get(&read, MIGRATION_COMPLETE_KEY)?.is_some())
+	}
+
+	/// Mark migration as successfully completed.
+	fn set_migration_complete(&self, write: &mut RwTxn<'_>) -> Result<(), Error> {
+		self.def_db.put(write, MIGRATION_COMPLETE_KEY, b"1")?;
+		Ok(())
+	}
+
 	/// Migrate database from provided path to default environment.
 	fn migrate_to_default_env(
 		&self,
 		from_name: Option<&str>,
 		from_path: &Path,
+		db_migration_prog_tx: Option<mpsc::Sender<i8>>,
 	) -> Result<(), Error> {
 		info!("Migrating DB {:?}, please wait...", from_path);
+
+		if let Some(migration_prog_tx) = &db_migration_prog_tx {
+			let _ = migration_prog_tx.send(0i8);
+		}
+
 		let from_env = unsafe {
 			let mut options = EnvOpenOptions::new().read_txn_without_tls();
 			let env_options = options.map_size(self.alloc_chunk_size).max_dbs(24);
@@ -307,7 +348,16 @@ impl Store {
 		let mut write_to = self.env.write_txn()?;
 		let read_from = from_env.read_txn()?;
 		let mut count = 0;
-		for kv in db_from.iter(&read_from)? {
+		let total = db_from.iter(&read_from)?.count();
+		let mut prev_prog = 0;
+		for (index, kv) in db_from.iter(&read_from)?.enumerate() {
+			if let Some(migration_prog_tx) = &db_migration_prog_tx {
+				let prog = 100 * index / total;
+				if prev_prog != prog && prog != 100 {
+					prev_prog = prog;
+					let _ = migration_prog_tx.send(prog as i8);
+				}
+			}
 			let (k, v) = kv?;
 			if k.len() > 1 && k[1] == PREFIX_KEY_SEPARATOR {
 				let db_name = k.split_at(1).0;
@@ -323,7 +373,13 @@ impl Store {
 				count += 1;
 			}
 		}
+		self.set_migration_complete(&mut write_to)?;
 		write_to.commit()?;
+
+		if let Some(migration_prog_tx) = &db_migration_prog_tx {
+			let _ = migration_prog_tx.send(100i8);
+		}
+
 		info!("Migrated {} records from {:?}", count, from_path);
 		Ok(())
 	}
@@ -367,7 +423,7 @@ impl Store {
 	/// Wait while database is resizing.
 	fn wait_for_resize(&self) {
 		loop {
-			if !ENV_MAP
+			if ENV_MAP
 				.get()
 				.unwrap()
 				.read()
@@ -375,11 +431,13 @@ impl Store {
 				.unwrap()
 				.resizing
 				.load(Ordering::Relaxed)
+				&& self.open_txs_count() == 0
 			{
-				break;
+				debug!("Wait on resizing DB {}", self.env_path);
+				thread::sleep(Duration::from_millis(100));
+				continue;
 			}
-			trace!("Wait on resizing DB {}", self.env_path);
-			thread::sleep(Duration::from_millis(100));
+			break;
 		}
 	}
 
@@ -399,9 +457,16 @@ impl Store {
 			let env_path = self.env_path.clone();
 			let env = self.env.clone();
 
+			{
+				let mut w_env_map = ENV_MAP.get().unwrap().write();
+				let env_state = w_env_map.get_mut(&env_path).unwrap();
+				env_state.resizing.store(true, Ordering::Relaxed);
+			}
+
 			// Resize immediately or at another thread to not interrupt current
 			// transaction waiting all open transactions to be closed.
 			if self.open_txs_count() != 0 {
+				debug!("Waiting txs to be closed before DB {} resize", env_path);
 				thread::spawn(move || {
 					loop {
 						let txs_count = ENV_MAP
@@ -414,19 +479,9 @@ impl Store {
 							.load(Ordering::Relaxed);
 						if txs_count == 0 {
 							debug!("Start resizing DB {}", env_path);
-							ENV_MAP
-								.get()
-								.unwrap()
-								.write()
-								.get_mut(&env_path)
-								.unwrap()
-								.resizing
-								.store(true, Ordering::Relaxed);
-							// Wait to make sure there are no more active txs left.
-							thread::sleep(Duration::from_millis(1000));
 							break;
 						}
-						thread::sleep(Duration::from_millis(10));
+						thread::sleep(Duration::from_millis(100));
 					}
 
 					unsafe {
@@ -443,17 +498,15 @@ impl Store {
 				});
 				return;
 			} else {
-				let mut w_env_map = ENV_MAP.get().unwrap().write();
-				let env_state = w_env_map.get_mut(&env_path).unwrap();
-
 				debug!("Start immediate resizing DB {}", env_path);
-				env_state.resizing.store(true, Ordering::Relaxed);
 				unsafe {
 					match env.resize(new_size) {
 						Ok(_) => debug!("End resizing DB {}", env_path),
 						Err(e) => error!("Resize DB {} error: {:?}", env_path, e),
 					}
 				}
+				let mut w_env_map = ENV_MAP.get().unwrap().write();
+				let env_state = w_env_map.get_mut(&env_path).unwrap();
 				env_state.resizing.store(false, Ordering::Relaxed);
 			}
 		}
@@ -577,27 +630,27 @@ impl Store {
 		self.wait_for_resize();
 
 		TxCounter::on_change_tx_count(&self.env_path, true);
-		match self.env.clone().static_read_txn() {
-			Ok(read) => {
-				let db_res = self.get_db(db_key);
-				match db_res {
-					Ok(db) => Ok(DatabaseIterator::new(
-						self,
-						Arc::new(db.clone()),
-						read,
-						deserialize,
-					)),
-					Err(e) => {
-						TxCounter::on_change_tx_count(&self.env_path, false);
-						Err(Error::from(e))
+		let res = {
+			match self.env.clone().static_read_txn() {
+				Ok(read) => {
+					let db_res = self.get_db(db_key);
+					match db_res {
+						Ok(db) => Ok(DatabaseIterator::new(
+							self,
+							Arc::new(db.clone()),
+							read,
+							deserialize,
+						)),
+						Err(e) => Err(Error::from(e)),
 					}
 				}
+				Err(e) => Err(Error::from(e)),
 			}
-			Err(e) => {
-				TxCounter::on_change_tx_count(&self.env_path, false);
-				Err(Error::from(e))
-			}
+		};
+		if res.is_err() {
+			TxCounter::on_change_tx_count(&self.env_path, false);
 		}
+		res
 	}
 
 	/// Builds a new batch to be used with this store.
@@ -605,13 +658,11 @@ impl Store {
 		self.maybe_resize();
 
 		TxCounter::on_change_tx_count(&self.env_path, true);
-		match Batch::new(self) {
-			Ok(batch) => Ok(batch),
-			Err(e) => {
-				TxCounter::on_change_tx_count(&self.env_path, false);
-				Err(e)
-			}
+		let res = { Batch::new(self) };
+		if res.is_err() {
+			TxCounter::on_change_tx_count(&self.env_path, false);
 		}
+		res
 	}
 }
 
@@ -741,28 +792,27 @@ impl<'a> Batch<'a> {
 		self.store.wait_for_resize();
 
 		TxCounter::on_change_tx_count(&self.store.env_path, true);
-		let read = self.write.nested_read_txn();
-		match read {
-			Ok(read) => {
-				let db_res = self.store.get_db(db_key);
-				match db_res {
-					Ok(db) => Ok(DatabaseIterator::new(
-						self.store,
-						Arc::new(db.clone()),
-						read,
-						deserialize,
-					)),
-					Err(e) => {
-						TxCounter::on_change_tx_count(&self.store.env_path, false);
-						Err(Error::from(e))
+		let res = {
+			match self.write.nested_read_txn() {
+				Ok(read) => {
+					let db_res = self.store.get_db(db_key);
+					match db_res {
+						Ok(db) => Ok(DatabaseIterator::new(
+							self.store,
+							Arc::new(db.clone()),
+							read,
+							deserialize,
+						)),
+						Err(e) => Err(Error::from(e)),
 					}
 				}
+				Err(e) => Err(Error::from(e)),
 			}
-			Err(e) => {
-				TxCounter::on_change_tx_count(&self.store.env_path, false);
-				Err(Error::from(e))
-			}
+		};
+		if res.is_err() {
+			TxCounter::on_change_tx_count(&self.store.env_path, false);
 		}
+		res
 	}
 
 	/// Gets a `Readable` value from the database by provided key and deserialization strategy.
@@ -801,19 +851,22 @@ impl<'a> Batch<'a> {
 	/// commit, abandoned otherwise.
 	pub fn child(&mut self) -> Result<Batch<'_>, Error> {
 		TxCounter::on_change_tx_count(&self.store.env_path, true);
-		match self.store.env.nested_write_txn(&mut self.write) {
-			Ok(write) => Ok(Batch {
-				store: self.store,
-				write,
-				tx_counter: TxCounter {
-					env_path: self.store.env_path.clone(),
-				},
-			}),
-			Err(e) => {
-				TxCounter::on_change_tx_count(&self.store.env_path, false);
-				Err(Error::from(e))
+		let res = {
+			match self.store.env.nested_write_txn(&mut self.write) {
+				Ok(write) => Ok(Batch {
+					store: self.store,
+					write,
+					tx_counter: TxCounter {
+						env_path: self.store.env_path.clone(),
+					},
+				}),
+				Err(e) => Err(Error::from(e)),
 			}
+		};
+		if res.is_err() {
+			TxCounter::on_change_tx_count(&self.store.env_path, false);
 		}
+		res
 	}
 }
 
