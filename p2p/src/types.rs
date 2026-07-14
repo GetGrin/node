@@ -47,6 +47,9 @@ pub const USERNET_PEER_PORT: u16 = 23414;
 /// Maximum number of block headers a peer should ever send
 pub const MAX_BLOCK_HEADERS: u32 = 512;
 
+/// Header segment height used for PIHD header segment requests.
+pub const PIHD_HEADER_SEGMENT_HEIGHT: u8 = 9;
+
 /// Maximum number of block bodies a peer should ever ask for and send
 #[allow(dead_code)]
 pub const MAX_BLOCK_BODIES: u32 = 16;
@@ -72,6 +75,36 @@ const PEER_MIN_PREFERRED_OUTBOUND_COUNT: u32 = 8;
 /// The peer listener buffer count. Allows temporarily accepting more connections
 /// than allowed by PEER_MAX_INBOUND_COUNT to encourage network bootstrapping.
 const PEER_LISTENER_BUFFER_COUNT: u32 = 8;
+
+/// Number of headers represented by one PIHD header segment.
+pub fn pihd_header_segment_capacity() -> u64 {
+	let id = SegmentIdentifier {
+		height: PIHD_HEADER_SEGMENT_HEIGHT,
+		idx: 0,
+	};
+	let capacity = id.segment_capacity();
+	debug_assert_eq!(capacity, MAX_BLOCK_HEADERS as u64);
+	capacity
+}
+
+/// Segment index containing the next header after the given sync height.
+pub fn next_pihd_header_segment_idx(height: u64) -> u64 {
+	height / pihd_header_segment_capacity()
+}
+
+/// First header height covered by a PIHD header segment.
+pub fn pihd_header_segment_start_height(id: SegmentIdentifier) -> Option<u64> {
+	id.idx
+		.checked_mul(id.segment_capacity())
+		.and_then(|height| height.checked_add(1))
+}
+
+/// Last header height covered by a PIHD header segment.
+pub fn pihd_header_segment_end_height(id: SegmentIdentifier) -> Option<u64> {
+	id.idx
+		.checked_mul(id.segment_capacity())
+		.and_then(|height| height.checked_add(id.segment_capacity()))
+}
 
 #[derive(Debug)]
 pub enum Error {
@@ -185,19 +218,9 @@ impl<'de> Visitor<'de> for PeerAddrs {
 		let mut peers = Vec::with_capacity(access.size_hint().unwrap_or(0));
 
 		while let Some(entry) = access.next_element::<&str>()? {
-			match SocketAddr::from_str(entry) {
-				// Try to parse IP address first
-				Ok(ip) => peers.push(PeerAddr(ip)),
-				// If that fails it's probably a DNS record
-				Err(_) => {
-					let socket_addrs: Result<std::vec::IntoIter<SocketAddr>, M::Error> =
-						entry.to_socket_addrs().map_err(|_| {
-							serde::de::Error::custom(format!("Unable to resolve DNS: {}", entry))
-						});
-					if let Ok(socket_addrs) = socket_addrs {
-						peers.append(&mut socket_addrs.map(PeerAddr).collect());
-					}
-				}
+			match parse_peer_addr(entry, false) {
+				Ok(mut addrs) => peers.append(&mut addrs),
+				Err(e) => eprintln!("Skipping peer address {}: {}", entry, e),
 			}
 		}
 		Ok(PeerAddrs { peers })
@@ -213,14 +236,68 @@ impl<'de> Deserialize<'de> for PeerAddrs {
 	}
 }
 
+// Portless entries use the current chain's default peer port.
+fn default_peer_port() -> u16 {
+	match global::get_chain_type() {
+		global::ChainTypes::Testnet => TESTNET_PEER_PORT,
+		global::ChainTypes::UserTesting => USERNET_PEER_PORT,
+		_ => MAINNET_PEER_PORT,
+	}
+}
+
+fn parse_peer_addr(entry: &str, private_ip_wildcard: bool) -> Result<Vec<PeerAddr>, String> {
+	match SocketAddr::from_str(entry) {
+		Ok(addr) => Ok(vec![PeerAddr(addr)]),
+		Err(e) => {
+			if let Ok(ip) = IpAddr::from_str(entry) {
+				let port = if private_ip_wildcard && is_private_ip(&ip) {
+					0
+				} else {
+					default_peer_port()
+				};
+				return Ok(vec![PeerAddr(SocketAddr::new(ip, port))]);
+			}
+
+			let socket_addrs = match entry.to_socket_addrs() {
+				Ok(r) => r,
+				Err(_) => (entry, default_peer_port())
+					.to_socket_addrs()
+					.map_err(|e| format!("Unable to resolve DNS for {}: {}", entry, e))?,
+			};
+			let addrs: Vec<_> = socket_addrs.map(PeerAddr).collect();
+			debug!(
+				"Resolved peer address {} after socket parse error: {}",
+				entry, e
+			);
+			Ok(addrs)
+		}
+	}
+}
+
+fn deserialize_peer_filters<'de, D>(deserializer: D) -> Result<Option<PeerAddrs>, D::Error>
+where
+	D: Deserializer<'de>,
+{
+	let entries = Vec::<String>::deserialize(deserializer)?;
+	let mut peers = Vec::with_capacity(entries.len());
+	for entry in entries {
+		match parse_peer_addr(&entry, true) {
+			Ok(mut addrs) => peers.append(&mut addrs),
+			Err(e) => eprintln!("Skipping peer filter address {}: {}", entry, e),
+		}
+	}
+	Ok(Some(PeerAddrs { peers }))
+}
+
 impl std::hash::Hash for PeerAddr {
 	/// If private address then we care about ip and port.
 	/// If regular address then we only care about the ip and ignore the port.
 	fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-		if is_private_ip(&self.0.ip()) {
-			self.0.hash(state);
+		let ip = normalize_ip(self.0.ip());
+		if is_private_ip(&ip) {
+			SocketAddr::new(ip, self.0.port()).hash(state);
 		} else {
-			self.0.ip().hash(state);
+			ip.hash(state);
 		}
 	}
 }
@@ -229,10 +306,12 @@ impl PartialEq for PeerAddr {
 	/// If private address then we care about ip and port.
 	/// If regular address then we only care about the ip and ignore the port.
 	fn eq(&self, other: &PeerAddr) -> bool {
-		if is_private_ip(&self.0.ip()) {
-			self.0 == other.0
+		let ip = normalize_ip(self.0.ip());
+		let other_ip = normalize_ip(other.0.ip());
+		if is_private_ip(&ip) {
+			ip == other_ip && self.0.port() == other.0.port()
 		} else {
-			self.0.ip() == other.0.ip()
+			ip == other_ip
 		}
 	}
 }
@@ -240,21 +319,22 @@ impl PartialEq for PeerAddr {
 /// Check if IP address is private.
 /// Implementation taken from `core::net:ip_addr` while `is_global` is unstable.
 pub fn is_private_ip(ip: &IpAddr) -> bool {
-	match ip {
-		IpAddr::V4(ip) => {
-			ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_documentation()
+	// Check IPv4.
+	let check_ip_v4 = |ip: &Ipv4Addr| {
+		ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_documentation()
 			// addresses reserved for future protocols (`192.0.0.0/24`)
 			// .9 and .10 are documented as globally reachable so they're excluded
 			|| (
 			ip.octets()[0] == 192 && ip.octets()[1] == 0 && ip.octets()[2] == 0
 				&& ip.octets()[3] != 9 && ip.octets()[3] != 10
-			// this address is part of the Shared Address Space defined in
-			// [IETF RFC 6598] (`100.64.0.0/10`).
-			|| ip.octets()[0] == 100 && (ip.octets()[1] & 0b1100_0000 == 0b0100_0000)
+				// this address is part of the Shared Address Space defined in
+				// [IETF RFC 6598] (`100.64.0.0/10`).
+				|| ip.octets()[0] == 100 && (ip.octets()[1] & 0b1100_0000 == 0b0100_0000)
 		)
-		}
-		IpAddr::V6(ip) => {
-			ip.is_loopback() || ip.is_unspecified()
+	};
+	// Check IPv6.
+	let check_ip_v6 = |ip: &Ipv6Addr| {
+		ip.is_loopback() || ip.is_unspecified()
 			// IPv4-mapped Address (`::ffff:0:0/96`)
 			|| matches!(ip.segments(), [0, 0, 0, 0, 0, 0xffff, _, _])
 			// IPv4-IPv6 Translat. (`64:ff9b:1::/48`)
@@ -283,6 +363,16 @@ pub fn is_private_ip(ip: &IpAddr) -> bool {
 			|| matches!(ip.segments(), [0x5f00, ..])
 			|| ip.is_unique_local()
 			|| ip.is_unicast_link_local()
+	};
+	// Check if address is private.
+	match ip {
+		IpAddr::V4(ip) => check_ip_v4(ip),
+		IpAddr::V6(ip) => {
+			if let Some(ipv4) = ip.to_ipv4_mapped() {
+				check_ip_v4(&ipv4)
+			} else {
+				check_ip_v6(ip)
+			}
 		}
 	}
 }
@@ -294,25 +384,46 @@ impl fmt::Display for PeerAddr {
 		write!(f, "{}", self.0)
 	}
 }
+
+fn normalize_ip(ip: IpAddr) -> IpAddr {
+	if let IpAddr::V6(ipv6) = ip {
+		if let Some(ipv4) = ipv6.to_ipv4_mapped() {
+			return IpAddr::V4(ipv4);
+		}
+	}
+	ip
+}
+
 impl PeerAddr {
 	/// Convenient way of constructing a new peer address from an ip address.
 	pub fn from_ip(addr: IpAddr) -> PeerAddr {
-		let port = if global::is_testnet() {
-			TESTNET_PEER_PORT
-		} else {
-			MAINNET_PEER_PORT
-		};
-		PeerAddr(SocketAddr::new(addr, port))
+		PeerAddr(SocketAddr::new(addr, default_peer_port()))
 	}
 
 	/// If the ip is private then our key is "ip:port".
 	/// Otherwise, we only care about the ip (we disallow multiple peers on the same ip address).
 	pub fn as_key(&self) -> String {
-		if is_private_ip(&self.0.ip()) {
-			format!("{}:{}", self.0.ip(), self.0.port())
+		let ip = normalize_ip(self.0.ip());
+		if is_private_ip(&ip) {
+			format!("{}:{}", ip, self.0.port())
 		} else {
-			format!("{}", self.0.ip())
+			format!("{}", ip)
 		}
+	}
+
+	/// Match this filter entry against a peer address.
+	pub fn matches_filter(&self, peer_addr: &PeerAddr) -> bool {
+		let same_ip = normalize_ip(self.0.ip()) == normalize_ip(peer_addr.0.ip());
+		if is_private_ip(&self.0.ip()) {
+			same_ip && (self.0.port() == peer_addr.0.port() || self.0.port() == 0)
+		} else {
+			same_ip
+		}
+	}
+
+	/// Use key, ignoring port, used for banned pre-handshake peers.
+	pub fn as_ip_key(&self) -> String {
+		format!("{}", normalize_ip(self.0.ip()))
 	}
 }
 
@@ -329,8 +440,10 @@ pub struct P2PConfig {
 	/// The list of seed nodes, if using Seeding as a seed type
 	pub seeds: Option<PeerAddrs>,
 
+	#[serde(default, deserialize_with = "deserialize_peer_filters")]
 	pub peers_allow: Option<PeerAddrs>,
 
+	#[serde(default, deserialize_with = "deserialize_peer_filters")]
 	pub peers_deny: Option<PeerAddrs>,
 
 	/// The list of preferred peers that we will try to connect to
@@ -444,6 +557,8 @@ bitflags! {
 		const BLOCK_HIST = 0b0010_0000;
 		/// As above, with crucial serialization fix #3705 applied
 		const PIBD_HIST_1 = 0b0100_0000;
+		/// Can provide deterministic historical header segments.
+		const PIHD_HIST = 0b1000_0000;
 	}
 }
 
@@ -456,6 +571,7 @@ impl Default for Capabilities {
 			| Capabilities::TX_KERNEL_HASH
 			| Capabilities::PIBD_HIST
 			| Capabilities::PIBD_HIST_1
+			| Capabilities::PIHD_HIST
 	}
 }
 
@@ -595,6 +711,15 @@ pub struct TxHashSetRead {
 	pub reader: File,
 }
 
+/// Result of processing a PIHD header segment response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderSegmentAcceptance {
+	/// Segment was accepted or intentionally ignored.
+	Accepted,
+	/// Segment is malformed or invalid enough to justify banning the sender.
+	Ban,
+}
+
 /// Bridge between the networking layer and the rest of the system. Handles the
 /// forwarding or querying of blocks and transactions from the network among
 /// other things.
@@ -653,6 +778,13 @@ pub trait ChainAdapter: Sync + Send {
 	/// identify the common chain and gets the headers that follow it
 	/// immediately.
 	fn locate_headers(&self, locator: &[Hash]) -> Result<Vec<core::BlockHeader>, chain::Error>;
+
+	/// Finds a deterministic header segment based on the provided segment identifier.
+	fn locate_header_segment(
+		&self,
+		id: SegmentIdentifier,
+		peer_info: &PeerInfo,
+	) -> Result<Option<Vec<core::BlockHeader>>, chain::Error>;
 
 	/// Gets a full block by its hash.
 	/// Converts block to v2 compatibility if necessary (based on peer protocol version).
@@ -727,6 +859,7 @@ pub trait ChainAdapter: Sync + Send {
 		block_hash: Hash,
 		output_root: Hash,
 		segment: Segment<BitmapChunk>,
+		peer_info: &PeerInfo,
 	) -> Result<bool, chain::Error>;
 
 	fn receive_output_segment(
@@ -734,19 +867,29 @@ pub trait ChainAdapter: Sync + Send {
 		block_hash: Hash,
 		bitmap_root: Hash,
 		segment: Segment<OutputIdentifier>,
+		peer_info: &PeerInfo,
 	) -> Result<bool, chain::Error>;
 
 	fn receive_rangeproof_segment(
 		&self,
 		block_hash: Hash,
 		segment: Segment<RangeProof>,
+		peer_info: &PeerInfo,
 	) -> Result<bool, chain::Error>;
 
 	fn receive_kernel_segment(
 		&self,
 		block_hash: Hash,
 		segment: Segment<TxKernel>,
+		peer_info: &PeerInfo,
 	) -> Result<bool, chain::Error>;
+
+	fn receive_header_segment(
+		&self,
+		id: SegmentIdentifier,
+		headers: &[core::BlockHeader],
+		peer_info: &PeerInfo,
+	) -> Result<HeaderSegmentAcceptance, chain::Error>;
 }
 
 /// Additional methods required by the protocol that don't need to be

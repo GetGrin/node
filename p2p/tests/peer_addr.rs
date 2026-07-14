@@ -15,8 +15,12 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+use chrono::Utc;
+use grin_core::global;
 use grin_p2p as p2p;
+use tempfile::tempdir;
 
+use crate::p2p::store::PeerStore;
 use crate::p2p::types::PeerAddr;
 
 // Test the behavior of a hashmap of peers keyed by peer_addr.
@@ -79,4 +83,83 @@ fn test_peer_addr_hashing() {
 
 	// Check they are treated as not the same even though their underlying ports are different.
 	assert_ne!(peer_addr1, peer_addr2);
+	assert_eq!(peer_addr1.as_key(), "192.168.1.2:8080");
+	assert_eq!(peer_addr1.as_ip_key(), peer_addr2.as_ip_key());
+
+	let mapped_addr = PeerAddr("[::ffff:192.168.1.2]:8082".parse().unwrap());
+	assert_eq!(mapped_addr.as_key(), "192.168.1.2:8082");
+	assert_eq!(peer_addr1.as_ip_key(), mapped_addr.as_ip_key());
+
+	let mapped_same_port = PeerAddr("[::ffff:192.168.1.2]:8080".parse().unwrap());
+	assert_eq!(peer_addr1, mapped_same_port);
+	assert!(peers.contains_key(&mapped_same_port));
+
+	let deny_addr = PeerAddr("192.168.1.2:0".parse().unwrap());
+	assert!(deny_addr.matches_filter(&peer_addr2));
+	assert!(deny_addr.matches_filter(&mapped_addr));
+
+	let public_addr = PeerAddr("185.147.152.14:8080".parse().unwrap());
+	let mapped_public_addr = PeerAddr("[::ffff:185.147.152.14]:8081".parse().unwrap());
+	assert_eq!(public_addr, mapped_public_addr);
+	assert_eq!(public_addr.as_key(), mapped_public_addr.as_key());
+}
+
+fn store_banned_peer(addr: PeerAddr) -> PeerStore {
+	let dir = tempdir().unwrap();
+	let store = PeerStore::new(dir.path().to_str().unwrap()).unwrap();
+	let peer = p2p::PeerData {
+		addr,
+		capabilities: p2p::Capabilities::UNKNOWN,
+		user_agent: "".to_string(),
+		flags: p2p::State::Banned,
+		last_banned: Utc::now().timestamp(),
+		ban_reason: p2p::ReasonForBan::ManualBan,
+		last_connected: 0,
+		last_attempt: 0,
+	};
+
+	store.save_peer(&peer).unwrap();
+	store
+}
+
+#[test]
+fn test_peer_store_private_ip_key() {
+	global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
+
+	let addr = PeerAddr("192.168.1.5:3414".parse().unwrap());
+	let store = store_banned_peer(addr);
+
+	assert!(store.exists_peer(addr).unwrap().0);
+	assert_eq!(store.exists_peer(addr).unwrap().1, addr.as_key());
+	assert_eq!(store.get_peer(addr).unwrap().0.flags, p2p::State::Banned);
+	assert!(
+		!store
+			.exists_peer(PeerAddr("192.168.1.5:9999".parse().unwrap()))
+			.unwrap()
+			.0
+	);
+
+	store.unban_peer(addr).unwrap();
+	assert!(!store.exists_peer(addr).unwrap().0);
+}
+
+#[test]
+fn test_peer_store_public_ip_key() {
+	global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
+
+	let addr = PeerAddr("185.168.1.5:3414".parse().unwrap());
+	let store = store_banned_peer(addr);
+
+	assert!(store.exists_peer(addr).unwrap().0);
+	assert_eq!(store.exists_peer(addr).unwrap().1, addr.as_key());
+	assert_eq!(store.get_peer(addr).unwrap().0.flags, p2p::State::Banned);
+	assert!(
+		store
+			.exists_peer(PeerAddr("185.168.1.5:9999".parse().unwrap()))
+			.unwrap()
+			.0
+	);
+
+	store.unban_peer(addr).unwrap();
+	assert!(store.exists_peer(addr).unwrap().0);
 }
