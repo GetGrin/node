@@ -1,13 +1,28 @@
+// Copyright 2026 The Grin Developers
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use grin_api as api;
 use grin_util as util;
 
 use crate::api::*;
-use futures::channel::oneshot;
-use hyper::{Body, Request, StatusCode};
-use std::net::SocketAddr;
+use hyper::body::Incoming;
+use hyper::{Request, StatusCode};
+use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::{thread, time};
+use tokio::sync::mpsc;
 
 struct IndexHandler {
 	list: Vec<String>,
@@ -16,7 +31,7 @@ struct IndexHandler {
 impl IndexHandler {}
 
 impl Handler for IndexHandler {
-	fn get(&self, _req: Request<Body>) -> ResponseFuture {
+	fn get(&self, _req: Request<Incoming>) -> ResponseFuture {
 		json_response_pretty(&self.list)
 	}
 }
@@ -40,13 +55,13 @@ impl CounterMiddleware {
 impl Handler for CounterMiddleware {
 	fn call(
 		&self,
-		req: Request<Body>,
+		req: Request<Incoming>,
 		mut handlers: Box<dyn Iterator<Item = HandlerObj>>,
 	) -> ResponseFuture {
 		self.counter.fetch_add(1, Ordering::SeqCst);
 		match handlers.next() {
 			Some(h) => h.call(req, handlers),
-			None => return response(StatusCode::INTERNAL_SERVER_ERROR, "no handler found"),
+			None => response(StatusCode::INTERNAL_SERVER_ERROR, "no handler found".into()),
 		}
 	}
 }
@@ -62,18 +77,28 @@ fn build_router() -> Router {
 	router
 }
 
+fn open_port(host: &str) -> u16 {
+	// use port 0 to allow the OS to assign an open port
+	// TcpListener's Drop impl will unbind the port as soon as
+	// listener goes out of scope
+	let listener = TcpListener::bind(format!("{}:0", host)).unwrap();
+	listener.local_addr().unwrap().port()
+}
+
 #[test]
 fn test_start_api() {
+	let _ = rustls::crypto::ring::default_provider().install_default();
 	util::init_test_logger();
 	let mut server = ApiServer::new();
 	let mut router = build_router();
 	let counter = Arc::new(CounterMiddleware::new());
 	// add middleware to the root
 	router.add_middleware(counter.clone());
-	let server_addr = "127.0.0.1:14434";
+	let server_host = "127.0.0.1";
+	let server_port = open_port(server_host);
+	let server_addr = format!("{}:{}", server_host, server_port);
 	let addr: SocketAddr = server_addr.parse().expect("unable to parse server address");
-	let api_chan: &'static mut (oneshot::Sender<()>, oneshot::Receiver<()>) =
-		Box::leak(Box::new(oneshot::channel::<()>()));
+	let api_chan = mpsc::channel::<()>(1);
 	assert!(server.start(addr, router, None, api_chan).is_ok());
 	let url = format!("http://{}/v1/", server_addr);
 	let index = request_with_retry(url.as_str()).unwrap();
@@ -83,6 +108,24 @@ fn test_start_api() {
 	thread::sleep(time::Duration::from_millis(1_000));
 }
 
+#[test]
+fn test_start_api_address_in_use() {
+	let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+	let addr = listener.local_addr().unwrap();
+	let mut server = ApiServer::new();
+
+	assert!(server
+		.start(addr, build_router(), None, mpsc::channel::<()>(1))
+		.is_err());
+
+	drop(listener);
+	let handle = server
+		.start(addr, build_router(), None, mpsc::channel::<()>(1))
+		.unwrap();
+	assert!(server.stop());
+	handle.join().unwrap();
+}
+
 // To enable this test you need a trusted PKCS12 (p12) certificate bundle
 // Hyper-tls client doesn't accept self-signed certificates. The easiest way is to use mkcert
 // https://github.com/FiloSottile/mkcert to install CA and generate a certificate on your local machine.
@@ -90,6 +133,7 @@ fn test_start_api() {
 #[ignore]
 #[test]
 fn test_start_api_tls() {
+	let _ = rustls::crypto::ring::default_provider().install_default();
 	util::init_test_logger();
 	let tls_conf = TLSConfig::new(
 		"tests/fullchain.pem".to_string(),
@@ -97,20 +141,21 @@ fn test_start_api_tls() {
 	);
 	let mut server = ApiServer::new();
 	let router = build_router();
-	let server_addr = "0.0.0.0:14444";
+	let server_host = "0.0.0.0";
+	let server_port = open_port(server_host);
+	let server_addr = format!("{}:{}", server_host, server_port);
 	let addr: SocketAddr = server_addr.parse().expect("unable to parse server address");
-	let api_chan: &'static mut (oneshot::Sender<()>, oneshot::Receiver<()>) =
-		Box::leak(Box::new(oneshot::channel::<()>()));
+	let api_chan = mpsc::channel::<()>(1);
 	assert!(server.start(addr, router, Some(tls_conf), api_chan).is_ok());
 	let index = request_with_retry("https://yourdomain.com:14444/v1/").unwrap();
 	assert_eq!(index.len(), 2);
-	assert!(!server.stop());
+	assert!(server.stop())
 }
 
-fn request_with_retry(url: &str) -> Result<Vec<String>, api::Error> {
+fn request_with_retry(url: &str) -> Result<Vec<String>, Error> {
 	let mut tries = 0;
 	loop {
-		let res = api::client::get::<Vec<String>>(url, None);
+		let res = client::get::<Vec<String>>(url, None);
 		if res.is_ok() {
 			return res;
 		}
