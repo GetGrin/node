@@ -1241,6 +1241,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "log",
+ "millisecond",
  "rand 0.6.5",
  "serde",
  "serde_derive",
@@ -1903,6 +1904,12 @@ dependencies = [
  "libc",
  "winapi",
 ]
+
+[[package]]
+name = "millisecond"
+version = "0.15.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b64459a911d6996e76aa2e708f88858891d98aaf1a1ab9ffb81415a33a768d79"
 
 [[package]]
 name = "miniz_oxide"
