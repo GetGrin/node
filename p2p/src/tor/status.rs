@@ -142,15 +142,7 @@ fn update_status(status: &mut ServiceStatus, state: OnionServiceState, problem: 
 		Running => ServiceStatus::Running,
 		DegradedReachable => ServiceStatus::Degraded,
 		Recovering => ServiceStatus::Recovering,
-		Bootstrapping => {
-			//TODO: Currently arti is not showing right status when publisher still has
-			// Bootstrapping status, so we set Running after Recovering.
-			if matches!(status, ServiceStatus::Recovering) {
-				ServiceStatus::Running
-			} else {
-				ServiceStatus::Recovering
-			}
-		}
+		Bootstrapping => ServiceStatus::Starting,
 		Broken | DegradedUnreachable => ServiceStatus::Errored(Error::Generic(
 			problem
 				.map(str::to_owned)
@@ -182,13 +174,13 @@ mod tests {
 	fn service_states() {
 		let mut status = ServiceStatus::Starting;
 		update_status(&mut status, Bootstrapping, None);
-		assert!(matches!(status, ServiceStatus::Recovering));
+		assert!(matches!(status, ServiceStatus::Starting));
 		update_status(&mut status, Running, None);
 		assert!(matches!(status, ServiceStatus::Running));
 		update_status(&mut status, DegradedReachable, None);
 		assert!(matches!(status, ServiceStatus::Degraded));
 		update_status(&mut status, Bootstrapping, None);
-		assert!(matches!(status, ServiceStatus::Recovering));
+		assert!(matches!(status, ServiceStatus::Starting));
 		update_status(&mut status, Recovering, None);
 		assert!(matches!(status, ServiceStatus::Recovering));
 		update_status(&mut status, DegradedUnreachable, Some("upload failed"));
