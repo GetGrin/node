@@ -19,13 +19,13 @@ use crate::tor::{Error, PostError};
 
 use arti_client::StreamPrefs;
 use async_trait::async_trait;
-use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
-use hyper::body::Body;
+use hyper::body::{Body, Bytes};
 use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_tls::HttpsConnector;
 use serde::de::StdError;
 use std::collections::HashMap;
+use tokio::runtime::{Handle, Id};
 use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout_at, Instant};
@@ -52,7 +52,11 @@ impl<T> TorContext<T> {
 	/// Further requests require a new context
 	pub async fn close(&self) {
 		self.closed.send_replace(true);
-		*self.state.lock().await = ConnectionState::default();
+		let mut state = self.state.lock().await;
+		if let Some((_, connection)) = state.cached.as_mut() {
+			connection.close().await;
+		}
+		*state = ConnectionState::default();
 	}
 }
 
@@ -135,7 +139,7 @@ impl<T: TorConfig> TorContext<T> {
 		body: String,
 		limit: usize,
 	) -> Result<Response<String>, Error> {
-		let deadline = Instant::now() + request_timeout(&self.config);
+		let deadline = request_deadline(&self.config)?;
 		let (url, request) = build_request(method, body, headers, url).map_err(Error::Post)?;
 		let mut closed = self.closed.subscribe();
 		if *closed.borrow() {
@@ -175,7 +179,7 @@ async fn request_tor<T: TorConfig>(
 	body: String,
 	response_limit: usize,
 ) -> Result<Response<String>, Error> {
-	let deadline = Instant::now() + request_timeout(config);
+	let deadline = request_deadline(config)?;
 	let (url, request) = build_request(method, body, headers, url).map_err(Error::Post)?;
 	let (_close, mut closed) = watch::channel(false);
 	exchange(
@@ -191,6 +195,12 @@ async fn request_tor<T: TorConfig>(
 		&mut closed,
 	)
 	.await
+}
+
+fn request_deadline<T: TorConfig>(config: &T) -> Result<Instant, Error> {
+	Instant::now()
+		.checked_add(request_timeout(config))
+		.ok_or_else(|| Error::Config("Tor request timeout is too large".into()))
 }
 
 async fn exchange<T: TorConfig>(
@@ -215,6 +225,7 @@ async fn exchange<T: TorConfig>(
 	let mut cached = state.cached.take().filter(|(target, connection)| {
 		target.scheme() == url.scheme()
 			&& target.authority() == url.authority()
+			&& connection.runtime_id == Handle::current().id()
 			&& !connection.sender.is_closed()
 	});
 	loop {
@@ -370,6 +381,8 @@ async fn connect_http(proxy: Uri, url: &Uri) -> Result<HttpConnection, Error> {
 pub(super) struct HttpConnection {
 	pub sender: hyper::client::conn::http1::SendRequest<Full<Bytes>>,
 	driver: JoinHandle<()>,
+	runtime_id: Id,
+	_keepalive: Box<dyn Send>,
 }
 
 impl HttpConnection {
@@ -391,10 +404,16 @@ impl HttpConnection {
 		Ok(Self {
 			sender,
 			driver: tokio::spawn(async move {
-				let _keepalive = keepalive;
 				let _ = driver.await;
 			}),
+			runtime_id: Handle::current().id(),
+			_keepalive: Box::new(keepalive),
 		})
+	}
+
+	async fn close(&mut self) {
+		self.driver.abort();
+		let _ = (&mut self.driver).await;
 	}
 
 	async fn send(
@@ -730,7 +749,26 @@ mod tests {
 			.unwrap()
 			.unwrap();
 		assert!(context.state.lock().await.cached.is_none());
-		context.close().await;
+		let (stream, mut peer) = tokio::io::duplex(1024);
+		let keepalive = std::sync::Arc::new(());
+		let released = std::sync::Arc::downgrade(&keepalive);
+		context.state.lock().await.cached = Some((
+			"http://example.onion/".parse().unwrap(),
+			HttpConnection::open_held(TokioIo::new(stream), keepalive)
+				.await
+				.unwrap(),
+		));
+		let close = || async {
+			context.close().await;
+			assert!(released.upgrade().is_none());
+		};
+		timeout(
+			Duration::from_secs(1),
+			futures::future::join(close(), close()),
+		)
+		.await
+		.unwrap();
+		assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
 	}
 
 	#[tokio::test]

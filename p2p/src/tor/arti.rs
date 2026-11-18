@@ -119,6 +119,14 @@ fn runtime() -> Result<TokioNativeTlsRuntime, Error> {
 	Ok(r.clone())
 }
 
+pub(super) fn outside_tokio(start: impl FnOnce() -> Result<(), Error> + Send) -> Result<(), Error> {
+	if tokio::runtime::Handle::try_current().is_err() {
+		return start();
+	}
+	thread::scope(|scope| scope.spawn(start).join())
+		.map_err(|_| Error::Generic("Arti startup panicked".into()))?
+}
+
 /// Stop running Tor service by onion address as key.
 pub(crate) fn stop_tor_service(onion_addr: String) -> Result<(), Error> {
 	let service = ARTI_PROXY_SERVICES.lock().unwrap().remove(&onion_addr);

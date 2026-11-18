@@ -63,7 +63,7 @@ use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use sysinfo::{Process, System, SystemExt};
+use sysinfo::{ProcessExt, System, SystemExt};
 
 #[cfg(windows)]
 const TOR_EXE_NAME: &str = "tor.exe";
@@ -202,14 +202,22 @@ impl TorProcess {
 		let lock = LockFileGuard::try_lock(Path::new(dir).join("lock"))
 			.map_err(Error::IO)?
 			.ok_or_else(|| Error::Process(format!("Tor data directory is in use: {}", dir)))?;
-		let pid_file_name = format!("{}{}pid", dir, MAIN_SEPARATOR);
-		// A PID file does not establish ownership
-		if Path::new(&pid_file_name).exists() {
-			let pid = fs::read_to_string(&pid_file_name).map_err(Error::IO)?;
-			let pid = pid
-				.parse::<i32>()
-				.map_err(|err| Error::PID(format!("{:?}", err)))?;
-			if self.get_process(pid).is_some() {
+		let pid = match fs::read_to_string(Path::new(dir).join("pid")) {
+			Ok(value) => value.trim().parse::<usize>().ok(),
+			Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+			Err(error) => return Err(Error::IO(error)),
+		};
+		if let Some(pid) = pid {
+			let torrc = fs::canonicalize(dir).map_err(Error::IO)?.join("torrc");
+			// A reused PID can belong to Tor running with a different configuration
+			self.sys.refresh_all();
+			if self.sys.process(pid.into()).is_some_and(|process| {
+				process.name().eq_ignore_ascii_case(TOR_EXE_NAME)
+					&& process
+						.cmd()
+						.windows(2)
+						.any(|args| args[0] == "-f" && Path::new(&args[1]) == torrc)
+			}) {
 				return Err(Error::Process(format!(
 					"Tor data directory is in use: {}",
 					dir
@@ -219,11 +227,6 @@ impl TorProcess {
 		self.dir_lock = Some(lock);
 		self.working_dir(dir);
 		Ok(())
-	}
-
-	fn get_process(&mut self, pid: i32) -> Option<&Process> {
-		self.sys.refresh_all();
-		self.sys.process((pid as usize).into())
 	}
 
 	pub fn torrc_path(&mut self, torrc_path: &str) -> &mut Self {
@@ -332,7 +335,6 @@ impl TorProcess {
 			Regex::new(r"^\[notice] Bootstrapped (?P<perc>[0-9]+)%(.*): ").map_err(Error::Regex)?;
 
 		let timestamp_len = "May 16 02:50:08.792".len();
-		let mut warnings = Vec::new();
 		let mut raw_line = String::new();
 
 		while stdout
@@ -344,9 +346,7 @@ impl TorProcess {
 				if raw_line.len() < timestamp_len + 1 {
 					return Err(Error::InvalidLogLine);
 				}
-				let timestamp = &raw_line[..timestamp_len];
 				let line = &raw_line[timestamp_len + 1..raw_line.len() - 1];
-				debug!("{} {}", timestamp, line);
 				match line.split(' ').nth(0) {
 					Some("[notice]") => {
 						if let Some("Bootstrapped") = line.split(' ').nth(1) {
@@ -354,15 +354,29 @@ impl TorProcess {
 								.captures(line)
 								.and_then(|c| c.name("perc"))
 								.and_then(|pc| pc.as_str().parse::<u8>().ok())
-								.ok_or_else(|| Error::InvalidBootstrapLine(line.to_string()))?;
+								.ok_or_else(|| {
+									Error::InvalidBootstrapLine("Invalid progress".into())
+								})?;
 
+							debug!("Tor bootstrap: {}%", perc);
 							if perc >= completion_perc {
 								return Ok(());
 							}
 						}
 					}
-					Some("[warn]") => warnings.push(line.to_string()),
-					Some("[err]") => return Err(Error::Tor(line.to_string(), warnings)),
+					Some("[warn]")
+						if line
+							.trim_end()
+							.ends_with("Failed to bind one of the listener ports.") =>
+					{
+						return Err(Error::Tor(
+							"Could not bind Tor listener port".into(),
+							Vec::new(),
+						));
+					}
+					Some("[err]") => {
+						return Err(Error::Tor("Tor bootstrap failed".into(), Vec::new()))
+					}
 					_ => (),
 				}
 			}
@@ -404,6 +418,19 @@ impl TorProcess {
 				}
 			}
 			process.wait().map_err(Error::IO)?;
+			if let Some(dir) = self
+				.working_dir
+				.as_ref()
+				.filter(|_| self.dir_lock.is_some())
+			{
+				let path = Path::new(dir).join("pid");
+				if fs::read_to_string(&path).is_ok_and(|pid| pid.trim().parse() == Ok(process.id()))
+				{
+					if let Err(error) = fs::remove_file(&path) {
+						warn!("Could not remove Tor PID file: {}", error);
+					}
+				}
+			}
 		}
 		let mut result = Ok(());
 		for reader in self.readers.drain(..) {
@@ -454,10 +481,8 @@ fn bridge_options(config: TorBridgeConfig) -> Result<Vec<(String, String)>, crat
 		let line = lines
 			.get(index)
 			.ok_or_else(|| crate::tor::Error::Config("Bad connection line".to_string()))?;
-		hm_tor_bridge.push(("Bridge".into(), super::bridge::bridge_line(line)?));
+		hm_tor_bridge.push(("Bridge".into(), line.clone()));
 	}
-
-	debug!("hm_tor_bridge {:?}", hm_tor_bridge);
 
 	Ok(hm_tor_bridge)
 }
@@ -576,7 +601,9 @@ webtunnel 192.0.3.1:443 0123456789ABCDEF0123456789ABCDEF01234567 url=https://exa
 
 	#[test]
 	fn stop_wait() {
+		let dir = tempfile::tempdir().unwrap();
 		let mut process = TorProcess::default();
+		process.lock_dir(dir.path().to_str().unwrap()).unwrap();
 		process.timeout(2);
 		process
 			.launch_command(command(
@@ -588,7 +615,10 @@ exec /bin/sleep 60"#,
 			))
 			.unwrap();
 		assert!(process.exit_status().unwrap().is_none());
+		let pid_file = dir.path().join("pid");
+		assert!(pid_file.is_file());
 		process.kill().unwrap();
+		assert!(!pid_file.exists());
 		assert!(process.process.is_none());
 		assert!(process.readers.is_empty());
 		process.kill().unwrap();
@@ -617,12 +647,12 @@ exec /bin/sleep 60"#,
 		)
 		.unwrap();
 		let mut other = TorProcess::default();
-		assert!(other.lock_dir(dir.path().to_str().unwrap()).is_err());
-		assert!(owner.exit_status().unwrap().is_none());
-		owner.kill().unwrap();
 		other.lock_dir(dir.path().to_str().unwrap()).unwrap();
+		assert!(owner.exit_status().unwrap().is_none());
 		assert!(owner.lock_dir(dir.path().to_str().unwrap()).is_err());
 		other.kill().unwrap();
+		assert!(dir.path().join("pid").is_file());
+		owner.kill().unwrap();
 		owner.lock_dir(dir.path().to_str().unwrap()).unwrap();
 	}
 }
