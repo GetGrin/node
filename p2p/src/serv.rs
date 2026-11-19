@@ -126,7 +126,8 @@ impl Server {
 								io::ErrorKind::UnexpectedEof
 									| io::ErrorKind::ConnectionAborted
 									| io::ErrorKind::ConnectionReset
-									| io::ErrorKind::BrokenPipe | io::ErrorKind::TimedOut
+									| io::ErrorKind::BrokenPipe
+									| io::ErrorKind::TimedOut
 							) {
 								debug!(
 									"Temporary peer connection error from {}: {:?}",
