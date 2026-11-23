@@ -1,4 +1,4 @@
-[submodule "p2p/tor/arti"]
-	path = p2p/tor/arti
+[submodule "tor/arti"]
+	path = tor/arti
 	url = https://code.gri.mw/ardocrat/arti
 	branch = grin-0.48

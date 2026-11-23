@@ -33,7 +33,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::chain::{self, SyncState};
 use crate::common::stats::{StratumStats, WorkerStats};
-use crate::common::types::StratumServerConfig;
+use crate::common::types::{Error, StratumServerConfig};
 use crate::core::consensus::graph_weight;
 use crate::core::core::hash::Hashed;
 use crate::core::core::Block;
@@ -48,6 +48,7 @@ type Tx = mpsc::Sender<String>;
 
 const WORKER_QUEUE_SIZE: usize = 64;
 const WORKER_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+const WORKER_LIMIT_WARN_INTERVAL: Duration = Duration::from_secs(60);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_RPC_LINE_BYTES: usize = 64 * 1024;
@@ -204,6 +205,21 @@ impl State {
 			minimum_share_difficulty,
 		}
 	}
+
+	fn update_coinbase_key(
+		&mut self,
+		requested: Option<keychain::Identifier>,
+		returned: Option<keychain::Identifier>,
+	) {
+		// Keep the wallet's key unless a winning submit reset it during the build.
+		if self.current_key_id == requested {
+			self.current_key_id = returned;
+		}
+	}
+
+	fn last_block(&self) -> Option<&Block> {
+		self.current_block_versions.last()
+	}
 }
 
 struct Handler {
@@ -247,10 +263,7 @@ impl Handler {
 		// Call the handler function for requested method
 		let response = match request.method.as_str() {
 			"login" => self.handle_login(request.params, worker_id),
-			"submit" => {
-				let res = self.handle_submit(request.params, worker_id);
-				res.map(|(v, _)| v)
-			}
+			"submit" => self.handle_submit(request.params, worker_id),
 			"keepalive" => self.handle_keepalive(),
 			"getjobtemplate" => {
 				if self.sync_state.is_syncing() {
@@ -304,9 +317,8 @@ impl Handler {
 			height: self
 				.current_state
 				.read()
-				.current_block_versions
-				.last()
-				.unwrap()
+				.last_block()
+				.ok_or(RpcError::internal_error())?
 				.header
 				.height,
 			difficulty: stats.pow_difficulty,
@@ -320,12 +332,14 @@ impl Handler {
 	// Handle GETJOBTEMPLATE message
 	fn handle_getjobtemplate(&self) -> Result<Value, RpcError> {
 		// Build a JobTemplate from a BlockHeader and return JSON
-		let job_template = self.build_block_template();
+		let job_template = self
+			.build_block_template()
+			.ok_or_else(RpcError::node_is_syncing)?;
 		// Height zero is the startup placeholder
 		if job_template.height == 0 {
 			return Err(RpcError::node_is_syncing());
 		}
-		let response = serde_json::to_value(&job_template).unwrap();
+		let response = serde_json::to_value(&job_template)?;
 		debug!(
 			"(Server ID: {}) sending block {} with id {} to single worker",
 			self.id, job_template.height, job_template.job_id,
@@ -334,48 +348,42 @@ impl Handler {
 	}
 
 	// Build and return a JobTemplate for mining the current block
-	fn build_block_template(&self) -> JobTemplate {
-		let bh = self
-			.current_state
-			.read()
-			.current_block_versions
-			.last()
-			.unwrap()
-			.header
-			.clone();
-		// Serialize the block header into pre and post nonce strings
+	fn build_block_template(&self) -> Option<JobTemplate> {
+		let state = self.current_state.read();
+		let bh = &state.last_block()?.header;
+		// Serialize the block header into pre- and post-nonce strings
 		let mut header_buf = vec![];
 		{
 			let mut writer = ser::BinWriter::default(&mut header_buf);
-			bh.write_pre_pow(&mut writer).unwrap();
-			bh.pow.write_pre_pow(&mut writer).unwrap();
+			bh.write_pre_pow(&mut writer).ok()?;
+			bh.pow.write_pre_pow(&mut writer).ok()?;
 		}
 		let pre_pow = header_buf.to_hex();
-		let current_state = self.current_state.read();
-		JobTemplate {
+		Some(JobTemplate {
 			height: bh.height,
-			job_id: (current_state.current_block_versions.len() - 1) as u64,
-			difficulty: current_state.minimum_share_difficulty,
+			job_id: (state.current_block_versions.len() - 1) as u64,
+			difficulty: state.minimum_share_difficulty,
 			pre_pow,
-		}
+		})
 	}
 	// Handle SUBMIT message
 	// params contains a solved block header
 	// We accept and log valid shares of all difficulty above configured minimum
 	// Accepted shares that are full solutions will also be submitted to the
 	// network
-	fn handle_submit(
-		&self,
-		params: Option<Value>,
-		worker_id: usize,
-	) -> Result<(Value, bool), RpcError> {
+	fn handle_submit(&self, params: Option<Value>, worker_id: usize) -> Result<Value, RpcError> {
 		// Validate parameters
 		let params: SubmitParams = parse_params(params)?;
 
 		let state = self.current_state.read();
 		// Find the correct version of the block to match this header
 		let b: Option<&Block> = state.current_block_versions.get(params.job_id as usize);
-		if params.height != state.current_block_versions.last().unwrap().header.height
+		if params.height
+			!= state
+				.last_block()
+				.ok_or(RpcError::internal_error())?
+				.header
+				.height
 			|| b.is_none()
 		{
 			// Return error status
@@ -510,13 +518,15 @@ impl Handler {
 		} else {
 			"ok".to_string()
 		};
-		Ok((serde_json::to_value(submit_response)?, share_is_block))
+		Ok(serde_json::to_value(submit_response)?)
 	} // handle submit a solution
 
 	fn broadcast_job(&self) {
 		debug!("broadcast job");
 		// Package new block into RpcRequest
-		let job_template = self.build_block_template();
+		let Some(job_template) = self.build_block_template() else {
+			return;
+		};
 		let job_template_json = serde_json::to_string(&job_template).unwrap();
 		// Issue #1159 - use a serde_json Value type to avoid extra quoting
 		let job_template_value: Value = serde_json::from_str(&job_template_json).unwrap();
@@ -542,17 +552,23 @@ impl Handler {
 	) {
 		debug!("Run main loop");
 		let mut deadline: i64 = 0;
-		let mut head = self.chain.head().unwrap();
-		let mut current_hash = head.prev_block_h;
+		let mut current_hash = None;
 		while !stop_state.is_stopped() {
 			// get the latest chain state
-			head = self.chain.head().unwrap();
+			let head = match self.chain.head() {
+				Ok(head) => head,
+				Err(e) => {
+					error!("Failed to read Stratum chain head: {}", e);
+					thread::sleep(SHUTDOWN_POLL_INTERVAL);
+					continue;
+				}
+			};
 			let latest_hash = head.last_block_h;
 
 			// Build a new block if there is at least one worker and
 			// There is a new block on the chain or its time to rebuild
 			// the current one to include new transactions
-			if (current_hash != latest_hash || Utc::now().timestamp() >= deadline)
+			if (current_hash != Some(latest_hash) || Utc::now().timestamp() >= deadline)
 				&& self.workers.count() > 0
 			{
 				{
@@ -562,8 +578,7 @@ impl Handler {
 					} else {
 						None
 					};
-					let state = self.current_state.read();
-					let key_id = state.current_key_id.clone();
+					let key_id = self.current_state.read().current_key_id.clone();
 					let requested_key_id = key_id.clone();
 
 					// Build the new block (version)
@@ -576,16 +591,18 @@ impl Handler {
 					) else {
 						return;
 					};
-					drop(state);
-
 					let mut state = self.current_state.write();
-					head = self.chain.head().unwrap();
+					state.update_coinbase_key(requested_key_id, block_fees.key_id);
+					let head = match self.chain.head() {
+						Ok(head) => head,
+						Err(e) => {
+							error!("Failed to read Stratum chain head: {}", e);
+							drop(state);
+							thread::sleep(SHUTDOWN_POLL_INTERVAL);
+							continue;
+						}
+					};
 					let latest_hash = head.last_block_h;
-					// Preserve the wallet-provided key for a stale build unless a winning
-					// submission reset the key while the block was being built.
-					if state.current_key_id == requested_key_id {
-						state.current_key_id = block_fees.key_id();
-					}
 					if new_block.header.prev_hash != latest_hash {
 						drop(state);
 						thread::sleep(Duration::from_millis(5));
@@ -593,13 +610,13 @@ impl Handler {
 					}
 
 					// If this is a new block we will clear the current_block version history
-					let clear_blocks = current_hash != latest_hash;
+					let clear_blocks = current_hash != Some(latest_hash);
 
 					// scaled difficulty
 					state.current_difficulty =
 						(new_block.header.total_difficulty() - head.total_difficulty).to_num();
 
-					current_hash = latest_hash;
+					current_hash = Some(latest_hash);
 					// set the minimum acceptable share unscaled difficulty for this block
 					state.minimum_share_difficulty = config.minimum_share_difficulty;
 
@@ -667,30 +684,43 @@ async fn handle_connection(socket: TcpStream, handler: Arc<Handler>, idle_timeou
 
 	let framed = Framed::new(socket, LinesCodec::new_with_max_length(MAX_RPC_LINE_BYTES));
 	let (mut writer, mut reader) = framed.split();
-	let (activity, mut activity_rx) = mpsc::channel::<()>(1);
+	let (activity, mut activity_rx) = watch::channel(false);
 	let read_activity = activity.clone();
 
 	let reader_handler = handler.clone();
 	let read = async move {
-		while let Some(line) = reader
-			.try_next()
-			.await
-			.map_err(|e| error!("Worker {} read error: {}", worker_id, e))?
+		let mut line = reader.try_next().await;
+		while let Some(request_line) =
+			line.map_err(|e| error!("Worker {} read error: {}", worker_id, e))?
 		{
-			let _ = read_activity.try_send(());
-			let request: RpcRequest = serde_json::from_str(&line).map_err(|e| {
+			let request: RpcRequest = serde_json::from_str(&request_line).map_err(|e| {
 				error!("Worker {} invalid JSON: {}", worker_id, e);
 			})?;
+			read_activity.send_replace(true);
+			let mut next_line = None;
 			if request.method == "getjobtemplate" && !reader_handler.sync_state.is_syncing() {
 				let mut job_ready = reader_handler.job_ready.subscribe();
-				// The worker idle timeout still applies
-				let _ = job_ready.wait_for(|ready| *ready).await;
+				tokio::select! {
+					biased;
+					_ = job_ready.wait_for(|ready| *ready) => {}
+					line = reader.try_next() => {
+						let Some(line) = line.map_err(|e| error!("Worker {} read error: {}", worker_id, e))? else {
+							break;
+						};
+						// Reply to the pending request before handling the next one.
+						next_line = Some(line);
+					}
+				}
 			}
 			let resp = reader_handler.handle_rpc_requests(request, worker_id);
 			if !reader_handler.workers.send_to(worker_id, resp).await {
 				warn!("Worker {} outbound queue closed", worker_id);
 				return Err(());
 			}
+			line = match next_line {
+				Some(line) => Ok(Some(line)),
+				None => reader.try_next().await,
+			};
 		}
 		Result::<_, ()>::Ok(())
 	};
@@ -699,7 +729,8 @@ async fn handle_connection(socket: TcpStream, handler: Arc<Handler>, idle_timeou
 		while let Some(line) = rx.recv().await {
 			match timeout(WORKER_WRITE_TIMEOUT, writer.send(line)).await {
 				Ok(Ok(())) => {
-					let _ = activity.try_send(());
+					// Count outbound traffic after the first request
+					activity.send_if_modified(|received| *received);
 				}
 				Ok(Err(e)) => {
 					error!("Worker {} write error: {}", worker_id, e);
@@ -724,15 +755,15 @@ async fn handle_connection(socket: TcpStream, handler: Arc<Handler>, idle_timeou
 			_ = &mut read => break,
 			_ = &mut write => break,
 			_ = &mut idle_sleep => {
-				if handler.sync_state.is_syncing() {
+				if *activity_rx.borrow() && handler.sync_state.is_syncing() {
 					idle_sleep.as_mut().reset(Instant::now() + idle_timeout);
 					continue;
 				}
 				warn!("Worker {} idle for {:?}; disconnecting", worker_id, idle_timeout);
 				break;
 			}
-			activity = activity_rx.recv() => {
-				if activity.is_some() {
+			activity = activity_rx.changed() => {
+				if activity.is_ok() {
 					idle_sleep.as_mut().reset(Instant::now() + idle_timeout);
 				} else {
 					break;
@@ -751,6 +782,7 @@ async fn accept_connections_loop(
 ) {
 	let mut connections = JoinSet::new();
 	let worker_limit = Arc::new(Semaphore::new(max_workers));
+	let mut next_limit_warning = Instant::now();
 	let mut shutdown_poll = tokio::time::interval(SHUTDOWN_POLL_INTERVAL);
 	loop {
 		tokio::select! {
@@ -765,10 +797,14 @@ async fn accept_connections_loop(
 						let permit = match worker_limit.clone().try_acquire_owned() {
 							Ok(permit) => permit,
 							Err(_) => {
-								debug!(
-									"Stratum: rejecting connection from {} (max workers: {})",
-									peer_addr, max_workers
-								);
+								let now = Instant::now();
+								if now >= next_limit_warning {
+									warn!(
+										"Stratum: rejecting connection from {} (max workers: {})",
+										peer_addr, max_workers
+									);
+									next_limit_warning = now + WORKER_LIMIT_WARN_INTERVAL;
+								}
 								drop(socket);
 								continue;
 							}
@@ -796,25 +832,6 @@ async fn accept_connections_loop(
 		}
 	}
 	connections.shutdown().await;
-}
-
-fn accept_connections(
-	listen_addr: SocketAddr,
-	handler: Arc<Handler>,
-	max_workers: usize,
-	idle_timeout: Duration,
-	stop_state: Arc<StopState>,
-) {
-	info!("Start tokio stratum server");
-	let task = async move {
-		let listener = TcpListener::bind(&listen_addr).await.unwrap_or_else(|_| {
-			panic!("Stratum: Failed to bind to listen address {}", listen_addr)
-		});
-		accept_connections_loop(listener, handler, max_workers, idle_timeout, stop_state).await;
-	};
-
-	let rt = Runtime::new().unwrap();
-	rt.block_on(task);
 }
 
 // ----------------------------------------
@@ -1000,6 +1017,39 @@ impl WorkersList {
 	}
 }
 
+pub(crate) fn validate_stratum_config(config: &StratumServerConfig) -> Result<SocketAddr, Error> {
+	if config.max_workers == 0 {
+		return Err(Error::Configuration(
+			"stratum max_workers must be greater than zero".to_string(),
+		));
+	}
+	if config.max_workers > Semaphore::MAX_PERMITS {
+		return Err(Error::Configuration(format!(
+			"stratum max_workers must not exceed {}",
+			Semaphore::MAX_PERMITS
+		)));
+	}
+	if config.worker_idle_timeout_secs == 0 {
+		return Err(Error::Configuration(
+			"stratum worker_idle_timeout_secs must be greater than zero".to_string(),
+		));
+	}
+	if std::time::Instant::now()
+		.checked_add(Duration::from_secs(config.worker_idle_timeout_secs))
+		.is_none()
+	{
+		return Err(Error::Configuration(
+			"stratum worker_idle_timeout_secs is too large".to_string(),
+		));
+	}
+	let address = config.stratum_server_addr.as_deref().ok_or_else(|| {
+		Error::Configuration("stratum_server_addr must be configured".to_string())
+	})?;
+	address.parse::<SocketAddr>().map_err(|e| {
+		Error::Configuration(format!("invalid stratum_server_addr '{}': {}", address, e))
+	})
+}
+
 /// Grin Stratum Server
 pub struct StratumServer {
 	id: String,
@@ -1039,7 +1089,15 @@ impl StratumServer {
 		proof_size: usize,
 		sync_state: Arc<SyncState>,
 		stop_state: Arc<StopState>,
-	) {
+	) -> Result<(), Error> {
+		let listen_addr = validate_stratum_config(&self.config)?;
+		let listener = std::net::TcpListener::bind(listen_addr)?;
+		listener.set_nonblocking(true)?;
+		let runtime = Runtime::new()?;
+		let listener = {
+			let _guard = runtime.enter();
+			TcpListener::from_std(listener)?
+		};
 		info!(
 			"(Server ID: {}) Starting stratum server with proof_size = {}",
 			self.id, proof_size
@@ -1047,29 +1105,22 @@ impl StratumServer {
 
 		self.sync_state = sync_state;
 
-		let listen_addr = self
-			.config
-			.stratum_server_addr
-			.clone()
-			.unwrap()
-			.parse()
-			.expect("Stratum: Incorrect address ");
-
 		let handler = Arc::new(Handler::from_stratum(self));
 		let h = handler.clone();
 		let max_workers = self.config.max_workers;
 		let idle_timeout = Duration::from_secs(self.config.worker_idle_timeout_secs);
 
 		let listener_stop_state = stop_state.clone();
-		let listener_th = thread::spawn(move || {
-			accept_connections(
-				listen_addr,
+		let listener_th = thread::Builder::new().spawn(move || {
+			info!("Start tokio stratum server");
+			runtime.block_on(accept_connections_loop(
+				listener,
 				h,
 				max_workers,
 				idle_timeout,
 				listener_stop_state,
-			);
-		});
+			));
+		})?;
 
 		// We have started
 		{
@@ -1081,7 +1132,12 @@ impl StratumServer {
 
 		warn!(
 			"Stratum server started on {}",
-			self.config.stratum_server_addr.clone().unwrap()
+			self.config
+				.stratum_server_addr
+				.clone()
+				.ok_or(Error::Configuration(
+					"Server address must be configured".to_string()
+				))?
 		);
 
 		// Initial Loop. Waiting node complete syncing
@@ -1097,6 +1153,7 @@ impl StratumServer {
 			error!("failed to join stratum listener thread: {:?}", e);
 		}
 		self.stratum_stats.write().is_running = false;
+		Ok(())
 	} // fn run_loop()
 } // StratumServer
 
@@ -1377,6 +1434,9 @@ mod tests {
 			Duration::from_millis(50),
 		));
 		wait_for_worker_count(&handler, 1).await;
+		let mut client = Framed::new(client, LinesCodec::new());
+		let request = serde_json::to_string(&rpc_request("keepalive", None)).unwrap();
+		client.send(request).await.unwrap();
 		tokio::time::sleep(Duration::from_millis(120)).await;
 		assert_eq!(handler.workers.count(), 1);
 
@@ -1401,6 +1461,9 @@ mod tests {
 			Duration::from_millis(50),
 		));
 		wait_for_worker_count(&handler, 1).await;
+		let mut client = Framed::new(client, LinesCodec::new());
+		let request = serde_json::to_string(&rpc_request("keepalive", None)).unwrap();
+		client.send(request).await.unwrap();
 
 		let broadcast_handler = handler.clone();
 		let broadcaster = tokio::spawn(async move {
@@ -1419,6 +1482,26 @@ mod tests {
 			.unwrap();
 		assert_eq!(handler.workers.count(), 0);
 		drop(client);
+	}
+
+	#[tokio::test]
+	async fn test_first_request_timeout() {
+		let handler = shared_handler();
+		handler.sync_state.update(SyncStatus::Initial);
+		let (_client, socket) = tcp_pair().await;
+		let task = tokio::spawn(handle_connection(
+			socket,
+			handler.clone(),
+			Duration::from_millis(50),
+		));
+		wait_for_worker_count(&handler, 1).await;
+		for _ in 0..20 {
+			handler.workers.broadcast("job".into());
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+		assert!(task.is_finished());
+		task.await.unwrap();
+		assert_eq!(handler.workers.count(), 0);
 	}
 
 	#[tokio::test]
@@ -1464,6 +1547,47 @@ mod tests {
 		drop(lines);
 		task.await.unwrap();
 		assert_eq!(handler.workers.count(), 0);
+	}
+
+	#[test]
+	fn test_stratum_port_in_use() {
+		use crate::common::adapters::{PoolToChainAdapter, PoolToNetAdapter};
+		use std::io::ErrorKind;
+
+		global::set_local_chain_type(ChainTypes::AutomatedTesting);
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let config = StratumServerConfig {
+			stratum_server_addr: Some(listener.local_addr().unwrap().to_string()),
+			..Default::default()
+		};
+		let tx_pool = Arc::new(RwLock::new(crate::pool::TransactionPool::new(
+			crate::pool::PoolConfig::default(),
+			Arc::new(PoolToChainAdapter::new()),
+			Arc::new(PoolToNetAdapter::new(Default::default())),
+		)));
+		let stats = Arc::new(RwLock::new(StratumStats::default()));
+		let mut server = StratumServer::new(config, shared_test_chain(), tx_pool, stats.clone());
+		let stop_state = Arc::new(StopState::new());
+		// Keep the test bounded even if startup incorrectly proceeds after a bind error.
+		stop_state.stop();
+		let result = server.run_loop(42, Arc::new(SyncState::new()), stop_state);
+		assert!(matches!(result, Err(Error::IOError(e)) if e.kind() == ErrorKind::AddrInUse));
+		assert!(!stats.read().is_running);
+	}
+
+	#[test]
+	fn test_coinbase_key_reset() {
+		global::set_local_chain_type(ChainTypes::AutomatedTesting);
+		let mut state = State::new(1);
+		let requested = Some(keychain::Identifier::zero());
+		let returned = Some(keychain::Identifier::from_bytes(&[1]));
+		state.current_key_id = requested.clone();
+		state.update_coinbase_key(requested.clone(), returned.clone());
+		assert_eq!(state.current_key_id, returned);
+
+		state.current_key_id = None;
+		state.update_coinbase_key(requested, returned);
+		assert!(state.current_key_id.is_none());
 	}
 
 	#[test]
@@ -1946,6 +2070,27 @@ mod tests {
 		let err = resp.error.unwrap();
 		assert_eq!(err["code"], -32000);
 		assert_eq!(err["message"], "Node is syncing - Please wait");
+	}
+
+	#[tokio::test]
+	async fn test_disconnect_before_job() {
+		let handler = shared_handler();
+		let (client, socket) = tcp_pair().await;
+		let task = tokio::spawn(handle_connection(
+			socket,
+			handler.clone(),
+			Duration::from_secs(5),
+		));
+		let mut client = Framed::new(client, LinesCodec::new());
+		let request = serde_json::to_string(&rpc_request("getjobtemplate", None)).unwrap();
+		client.send(request).await.unwrap();
+		drop(client);
+
+		timeout(Duration::from_secs(1), task)
+			.await
+			.unwrap()
+			.unwrap();
+		assert_eq!(handler.workers.count(), 0);
 	}
 
 	#[tokio::test]
